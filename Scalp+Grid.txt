@@ -1,0 +1,2295 @@
+//+------------------------------------------------------------------+
+//|                                    ScalpGrid                     |
+//|          Advanced Scalping + Grid EA - Complete Market Analysis  |
+//|          Rebuilt with proper CE, ZLSMA, multi-factor confluence  |
+//+------------------------------------------------------------------+
+#property copyright "ScalpGrid Pro v3.0 - Production Grade"
+#property link      "https://github.com/geraked/metatrader5"
+#property version   "3.00"
+#property description "Advanced Scalping + Grid EA using Chandelier Exit, ZLSMA,"
+#property description "RSI, Bollinger Bands, ADX, Volume Profile on Heikin Ashi"
+#property description "with intelligent grid recovery and confluence scoring"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\AccountInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+//+------------------------------------------------------------------+
+//| ENUMERATIONS                                                      |
+//+------------------------------------------------------------------+
+enum ENUM_SL_TYPE
+  {
+   SL_FIXED_POINTS,
+   SL_ATR_BASED,
+   SL_SWING_HIGH_LOW,
+   SL_CHANDELIER
+  };
+
+enum ENUM_RISK_MODE
+  {
+   RISK_PERCENT_BALANCE,
+   RISK_FIXED_LOT,
+   RISK_PERCENT_EQUITY
+  };
+
+enum ENUM_GRID_MODE
+  {
+   GRID_DISABLED,
+   GRID_SAME_DIRECTION,
+   GRID_MARTINGALE,
+   GRID_ANTI_MARTINGALE
+  };
+
+enum ENUM_VOLATILITY_REGIME
+  {
+   VOL_LOW,
+   VOL_NORMAL,
+   VOL_HIGH,
+   VOL_EXTREME
+  };
+
+enum ENUM_TREND_STATE
+  {
+   TREND_STRONG_UP,
+   TREND_WEAK_UP,
+   TREND_RANGING,
+   TREND_WEAK_DOWN,
+   TREND_STRONG_DOWN
+  };
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                  |
+//+------------------------------------------------------------------+
+input group "═══════════ SIGNAL INDICATORS ═══════════"
+input int         InpCEPeriod          = 22;
+input double      InpCEMultiplier      = 3.0;
+input int         InpZLSMAPeriod       = 32;
+input int         InpRSIPeriod         = 14;
+input double      InpRSIOverbought     = 70;
+input double      InpRSIOversold       = 30;
+input int         InpBBPeriod          = 20;
+input double      InpBBDeviation       = 2.0;
+input bool        InpUseHeikinAshi     = true;
+input bool        InpUseRSIFilter      = true;
+input bool        InpUseBBFilter       = false;
+
+input group "═══════════ ADVANCED ANALYSIS ═══════════"
+input bool        InpUseADXFilter      = true;      // Use ADX Trend Strength Filter
+input int         InpADXPeriod         = 14;         // ADX Period
+input double      InpADXThreshold      = 20;         // ADX Trending Threshold
+input double      InpADXStrongTrend    = 40;         // ADX Strong Trend Level
+input bool        InpUseVolatilityAdapt = true;      // Adapt to Volatility Regime
+input int         InpVolATRPeriod      = 50;         // Volatility ATR Lookback
+input double      InpVolHighMult       = 1.5;        // High Volatility ATR Multiple
+input double      InpVolExtremeMult    = 2.5;        // Extreme Volatility ATR Multiple
+input bool        InpUseVolumeConfirm  = true;       // Volume Confirmation
+input int         InpVolumeLookback    = 20;         // Volume MA Lookback
+input double      InpVolumeMinMult     = 1.2;        // Min Volume Multiple for Confirmation
+input bool        InpUseMultiTF        = false;      // Use Multi-Timeframe Confirmation
+input ENUM_TIMEFRAMES InpHTFPeriod     = PERIOD_H4;  // Higher Timeframe
+input int         InpMinConfluence     = 3;          // Minimum Confluence Score (1-6)
+input bool        InpUseMomentum       = true;       // Use Momentum Confirmation
+input int         InpMomentumPeriod    = 10;         // Momentum Period
+input bool        InpUseStructure      = true;       // Use Market Structure (HH/HL/LH/LL)
+input int         InpStructureLookback = 50;         // Structure Lookback Bars
+
+input group "═══════════ SCALPING SETTINGS ═══════════"
+input double      InpTPCoefficient     = 1.5;
+input ENUM_SL_TYPE InpSLType           = SL_ATR_BASED;
+input int         InpSLFixedPoints     = 200;
+input int         InpSLLookback        = 10;
+input int         InpSLDeviation       = 50;
+input double      InpATRMultSL         = 1.5;
+input bool        InpReverseSignal     = false;
+input bool        InpAdaptiveTP        = true;       // Adaptive TP based on volatility
+
+input group "═══════════ GRID SYSTEM ═══════════"
+input ENUM_GRID_MODE InpGridMode       = GRID_SAME_DIRECTION;
+input double      InpGridVolMultiplier = 1.0;
+input int         InpGridMaxLevels     = 10;
+input int         InpGridStepPoints    = 0;
+input double      InpGridATRMultStep   = 1.0;
+input double      InpGridTPPoints      = 0;
+input bool        InpGridBasketClose   = true;
+input double      InpGridBasketTP      = 0;
+input bool        InpGridSmartEntry    = true;       // Only add grid on pullback to value
+
+input group "═══════════ RISK MANAGEMENT ═══════════"
+input ENUM_RISK_MODE InpRiskMode       = RISK_PERCENT_BALANCE;
+input double      InpRiskValue         = 1.0;
+input bool        InpUseTrailing       = true;
+input double      InpTrailingLevel     = 50;
+input double      InpBreakEvenPoints   = 0;
+input double      InpEquityDDLimit     = 20;
+input double      InpMaxDailyLoss      = 0;
+
+input group "═══════════ POSITION LIMITS ═══════════"
+input bool        InpAllowNewPos       = true;
+input bool        InpAllowMultiplePos  = false;
+input double      InpMarginLevelLimit  = 300;
+input int         InpSpreadLimit       = 30;
+input int         InpMaxPositions      = 15;
+
+input group "═══════════ TIME FILTER ═══════════"
+input bool        InpUseTimeFilter     = false;
+input string      InpTradingStartTime  = "08:00";
+input string      InpTradingEndTime    = "20:00";
+input bool        InpCloseFriday       = false;
+input string      InpFridayCloseTime   = "20:00";
+
+input group "═══════════ AUXILIARY ═══════════"
+input int         InpSlippage          = 30;
+input int         InpTimerInterval     = 10;
+input ulong       InpMagicNumber       = 77777;
+input bool        InpShowPanel         = true;
+input string      InpEAComment         = "ScalpGrid_CEZ";
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                  |
+//+------------------------------------------------------------------+
+CTrade         trade;
+CPositionInfo  posInfo;
+CAccountInfo   accInfo;
+CSymbolInfo    symInfo;
+
+// Indicator handles
+int            g_hATR;
+int            g_hATR_CE;
+int            g_hATR_Vol;     // For volatility regime
+int            g_hRSI;
+int            g_hBB;
+int            g_hADX;
+int            g_hVolume;      // Tick volume or real volume
+int            g_hHTF_RSI;     // Higher timeframe RSI
+int            g_hHTF_ATR;     // Higher timeframe ATR
+int            g_hMomentum;    // Momentum indicator (ROC)
+
+// Chandelier Exit state - proper recursive tracking
+struct CEState
+  {
+   double         longStop;
+   double         shortStop;
+   int            direction;    // 1=bullish, -1=bearish
+   bool           valid;
+  };
+
+CEState        g_ceHistory[];   // Ring buffer for CE history
+int            g_ceHistorySize;
+int            g_ceHistoryIdx;
+
+double         g_ceLongStop;
+double         g_ceShortStop;
+int            g_ceDir;
+int            g_prevCeDir;
+
+// ZLSMA cache
+double         g_zlsmaCache[];
+int            g_zlsmaCacheBar;  // Bar count when cache was built
+
+// Heikin Ashi cache
+double         g_haOpen[];
+double         g_haClose[];
+double         g_haHigh[];
+double         g_haLow[];
+int            g_haCacheBar;
+
+// Analysis results
+double         g_zlsma1;
+double         g_zlsma2;
+double         g_zlsma3;        // Extra bar for slope analysis
+
+ENUM_VOLATILITY_REGIME g_volRegime;
+ENUM_TREND_STATE       g_trendState;
+double         g_atrCurrent;
+double         g_atrAverage;
+double         g_adxValue;
+double         g_adxPlusDI;
+double         g_adxMinusDI;
+double         g_volumeRatio;
+double         g_momentumValue;
+int            g_confluenceScore;
+int            g_lastSignal;
+int            g_lastConfluence;
+string         g_signalDetails;
+
+datetime       g_lastBarTime;
+double         g_dailyStartEquity;
+datetime       g_dailyResetTime;
+double         g_initialBalance;
+bool           g_initialized;
+int            g_warmupBars;
+int            g_warmupCount;
+
+// Market structure
+double         g_swingHighs[];
+double         g_swingLows[];
+int            g_structureDir;  // 1=bullish structure, -1=bearish, 0=neutral
+
+//+------------------------------------------------------------------+
+//| SAFE COPY BUFFER                                                  |
+//+------------------------------------------------------------------+
+bool SafeCopyBuffer(int handle, int bufferNum, int startPos, int count, double &arr[])
+  {
+   if(handle == INVALID_HANDLE)
+      return false;
+   ArrayResize(arr, count);
+   ArraySetAsSeries(arr, true);
+   int copied = CopyBuffer(handle, bufferNum, startPos, count, arr);
+   return (copied >= count);
+  }
+
+//+------------------------------------------------------------------+
+//| SAFE COPY RATES                                                   |
+//+------------------------------------------------------------------+
+bool SafeCopyRates(MqlRates &rates[], int startPos, int count)
+  {
+   ArrayResize(rates, count);
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, _Period, startPos, count, rates);
+   return (copied >= count);
+  }
+
+//+------------------------------------------------------------------+
+//| CALCULATE LSMA (Least Squares Moving Average)                     |
+//| Uses proper linear regression with extrapolation                  |
+//+------------------------------------------------------------------+
+double CalcLSMA(const double &prices[], int startIdx, int period, int arrSize)
+  {
+   if(startIdx < 0 || period <= 1 || (startIdx + period) > arrSize)
+      return 0;
+
+   double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+   double n = (double)period;
+
+   for(int i = 0; i < period; i++)
+     {
+      int idx = startIdx + i;
+      if(idx >= arrSize)
+         return 0;
+      double x = (double)(period - 1 - i);  // newest bar = highest x
+      double y = prices[idx];
+      sumX  += x;
+      sumY  += y;
+      sumXY += x * y;
+      sumX2 += x * x;
+     }
+
+   double denom = (n * sumX2 - sumX * sumX);
+   if(MathAbs(denom) < 1e-12)
+      return sumY / n;  // Flat line fallback
+
+   double slope     = (n * sumXY - sumX * sumY) / denom;
+   double intercept = (sumY - slope * sumX) / n;
+
+   // Extrapolate to the most recent point (x = n-1)
+   return intercept + slope * (n - 1.0);
+  }
+
+//+------------------------------------------------------------------+
+//| CALCULATE ZLSMA (Zero Lag LSMA)                                   |
+//| Proper implementation: 2 * LSMA(price) - LSMA(LSMA(price))      |
+//+------------------------------------------------------------------+
+double CalcZLSMA(int shift)
+  {
+   int period = InpZLSMAPeriod;
+   if(period <= 1)
+      return 0;
+
+   int needBars = shift + period * 2 + 10;
+
+   MqlRates rates[];
+   if(!SafeCopyRates(rates, 0, needBars))
+      return 0;
+
+   int ratesSize = ArraySize(rates);
+   if(ratesSize < needBars)
+      return 0;
+
+   // Extract close prices
+   double closes[];
+   ArrayResize(closes, ratesSize);
+   for(int i = 0; i < ratesSize; i++)
+      closes[i] = rates[i].close;
+
+   // Step 1: LSMA of close prices at the target shift
+   double lsma1 = CalcLSMA(closes, shift, period, ratesSize);
+   if(lsma1 == 0)
+      return 0;
+
+   // Step 2: Build array of LSMA values for period bars starting from shift
+   double lsmaArr[];
+   ArrayResize(lsmaArr, period);
+   for(int j = 0; j < period; j++)
+     {
+      int startIdx = shift + j;
+      if(startIdx + period > ratesSize)
+         return 0;
+      lsmaArr[j] = CalcLSMA(closes, startIdx, period, ratesSize);
+      if(lsmaArr[j] == 0)
+         return 0;
+     }
+
+   // Step 3: LSMA of LSMA values
+   double lsma2 = CalcLSMA(lsmaArr, 0, period, period);
+   if(lsma2 == 0)
+      return 0;
+
+   // Zero-lag correction: 2 * LSMA - LSMA(LSMA)
+   return 2.0 * lsma1 - lsma2;
+  }
+
+//+------------------------------------------------------------------+
+//| BUILD HEIKIN ASHI CACHE                                           |
+//| Proper recursive HA calculation                                   |
+//+------------------------------------------------------------------+
+bool BuildHeikinAshiCache(int count)
+  {
+   MqlRates rates[];
+   // Need extra bars for proper recursive initialization
+   int extra = 50;
+   int total = count + extra;
+
+   if(!SafeCopyRates(rates, 0, total))
+      return false;
+
+   int ratesSize = ArraySize(rates);
+   if(ratesSize < total)
+      return false;
+
+   ArrayResize(g_haOpen, ratesSize);
+   ArrayResize(g_haClose, ratesSize);
+   ArrayResize(g_haHigh, ratesSize);
+   ArrayResize(g_haLow, ratesSize);
+
+   // Build from oldest to newest (rates are series: [0]=newest)
+   // Start from the oldest bar
+   int oldest = ratesSize - 1;
+
+   // First HA bar
+   g_haClose[oldest] = (rates[oldest].open + rates[oldest].high +
+                         rates[oldest].low + rates[oldest].close) / 4.0;
+   g_haOpen[oldest]  = (rates[oldest].open + rates[oldest].close) / 2.0;
+   g_haHigh[oldest]  = rates[oldest].high;
+   g_haLow[oldest]   = rates[oldest].low;
+
+   // Build forward (from oldest-1 toward index 0)
+   for(int i = oldest - 1; i >= 0; i--)
+     {
+      g_haClose[i] = (rates[i].open + rates[i].high +
+                       rates[i].low + rates[i].close) / 4.0;
+      g_haOpen[i]  = (g_haOpen[i + 1] + g_haClose[i + 1]) / 2.0;
+      g_haHigh[i]  = MathMax(rates[i].high, MathMax(g_haOpen[i], g_haClose[i]));
+      g_haLow[i]   = MathMin(rates[i].low, MathMin(g_haOpen[i], g_haClose[i]));
+     }
+
+   g_haCacheBar = Bars(_Symbol, _Period);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| CALCULATE CHANDELIER EXIT                                         |
+//| Proper recursive implementation with full state tracking          |
+//+------------------------------------------------------------------+
+bool CalcChandelierExit()
+  {
+   int period = InpCEPeriod;
+   if(period <= 0)
+      return false;
+
+   int needBars = period * 3 + 10;
+
+   MqlRates rates[];
+   if(!SafeCopyRates(rates, 0, needBars))
+      return false;
+
+   int ratesSize = ArraySize(rates);
+   if(ratesSize < period + 5)
+      return false;
+
+   double atrBuf[];
+   if(!SafeCopyBuffer(g_hATR_CE, 0, 0, needBars, atrBuf))
+      return false;
+
+   int atrSize = ArraySize(atrBuf);
+   if(atrSize < 5)
+      return false;
+
+   // We need to compute CE for bars going back far enough to establish state,
+   // then use the final values. Compute for bars [period+5] down to [1].
+
+   // Initialize from deep history
+   int startBar = MathMin(ratesSize - period - 1, atrSize - 1);
+   startBar = MathMin(startBar, period * 2);
+
+   if(startBar < 3)
+      return false;
+
+   // Calculate initial values at startBar
+   double prevLongStop  = 0;
+   double prevShortStop = 0;
+   int    prevDir       = 0;
+   bool   firstCalc     = true;
+
+   for(int bar = startBar; bar >= 1; bar--)
+     {
+      if(bar >= ratesSize || bar >= atrSize)
+         continue;
+
+      // Highest high and lowest low over [bar .. bar+period-1]
+      double hh = -DBL_MAX;
+      double ll = DBL_MAX;
+      for(int k = bar; k < bar + period && k < ratesSize; k++)
+        {
+         if(rates[k].high > hh) hh = rates[k].high;
+         if(rates[k].low < ll)  ll = rates[k].low;
+        }
+
+      if(hh == -DBL_MAX || ll == DBL_MAX)
+         continue;
+      if(bar >= atrSize || atrBuf[bar] <= 0)
+         continue;
+
+      double longStop  = hh - InpCEMultiplier * atrBuf[bar];
+      double shortStop = ll + InpCEMultiplier * atrBuf[bar];
+
+      if(!firstCalc)
+        {
+         // Ratchet: only move stops in favorable direction
+         // For long stop: if previous close was above previous long stop,
+         // new long stop can only go higher
+         int prevBar = bar + 1;
+         if(prevBar < ratesSize)
+           {
+            if(rates[prevBar].close > prevLongStop)
+               longStop = MathMax(longStop, prevLongStop);
+            if(rates[prevBar].close < prevShortStop)
+               shortStop = MathMin(shortStop, prevShortStop);
+           }
+
+         // Direction determination
+         if(rates[bar].close > prevShortStop)
+            prevDir = 1;
+         else if(rates[bar].close < prevLongStop)
+            prevDir = -1;
+         // else: keep previous direction
+        }
+      else
+        {
+         // First calculation - determine initial direction
+         if(rates[bar].close > shortStop)
+            prevDir = 1;
+         else if(rates[bar].close < longStop)
+            prevDir = -1;
+         else
+            prevDir = 1;  // Default bullish
+         firstCalc = false;
+        }
+
+      prevLongStop  = longStop;
+      prevShortStop = shortStop;
+     }
+
+   // Store results
+   g_prevCeDir    = prevDir;
+
+   // Now compute bar[1] final values
+   {
+      double hh = -DBL_MAX;
+      double ll = DBL_MAX;
+      for(int k = 1; k < 1 + period && k < ratesSize; k++)
+        {
+         if(rates[k].high > hh) hh = rates[k].high;
+         if(rates[k].low < ll)  ll = rates[k].low;
+        }
+
+      if(hh > -DBL_MAX && ll < DBL_MAX && atrBuf[1] > 0)
+        {
+         g_ceLongStop  = hh - InpCEMultiplier * atrBuf[1];
+         g_ceShortStop = ll + InpCEMultiplier * atrBuf[1];
+
+         // Ratchet with previous
+         if(rates[2].close > prevLongStop)
+            g_ceLongStop = MathMax(g_ceLongStop, prevLongStop);
+         if(rates[2].close < prevShortStop)
+            g_ceShortStop = MathMin(g_ceShortStop, prevShortStop);
+
+         // Direction
+         if(rates[1].close > prevShortStop)
+            g_ceDir = 1;
+         else if(rates[1].close < prevLongStop)
+            g_ceDir = -1;
+         else
+            g_ceDir = prevDir;
+        }
+      else
+         return false;
+   }
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| DETECT VOLATILITY REGIME                                          |
+//+------------------------------------------------------------------+
+ENUM_VOLATILITY_REGIME DetectVolatilityRegime()
+  {
+   if(!InpUseVolatilityAdapt)
+      return VOL_NORMAL;
+
+   double atrCurrent[];
+   double atrLong[];
+
+   if(!SafeCopyBuffer(g_hATR, 0, 1, 1, atrCurrent))
+      return VOL_NORMAL;
+   if(!SafeCopyBuffer(g_hATR_Vol, 0, 1, 1, atrLong))
+      return VOL_NORMAL;
+
+   if(ArraySize(atrCurrent) < 1 || ArraySize(atrLong) < 1)
+      return VOL_NORMAL;
+   if(atrLong[0] <= 0)
+      return VOL_NORMAL;
+
+   g_atrCurrent = atrCurrent[0];
+   g_atrAverage = atrLong[0];
+
+   double ratio = g_atrCurrent / g_atrAverage;
+
+   if(ratio >= InpVolExtremeMult)
+      return VOL_EXTREME;
+   if(ratio >= InpVolHighMult)
+      return VOL_HIGH;
+   if(ratio <= 0.6)
+      return VOL_LOW;
+
+   return VOL_NORMAL;
+  }
+
+//+------------------------------------------------------------------+
+//| DETECT TREND STATE                                                |
+//+------------------------------------------------------------------+
+ENUM_TREND_STATE DetectTrendState()
+  {
+   if(!InpUseADXFilter)
+      return TREND_RANGING;
+
+   double adxMain[];
+   double adxPlus[];
+   double adxMinus[];
+
+   if(!SafeCopyBuffer(g_hADX, 0, 1, 3, adxMain))
+      return TREND_RANGING;
+   if(!SafeCopyBuffer(g_hADX, 1, 1, 3, adxPlus))
+      return TREND_RANGING;
+   if(!SafeCopyBuffer(g_hADX, 2, 1, 3, adxMinus))
+      return TREND_RANGING;
+
+   if(ArraySize(adxMain) < 2 || ArraySize(adxPlus) < 2 || ArraySize(adxMinus) < 2)
+      return TREND_RANGING;
+
+   g_adxValue   = adxMain[0];
+   g_adxPlusDI  = adxPlus[0];
+   g_adxMinusDI = adxMinus[0];
+
+   if(g_adxValue < InpADXThreshold)
+      return TREND_RANGING;
+
+   bool bullish = (g_adxPlusDI > g_adxMinusDI);
+
+   if(g_adxValue >= InpADXStrongTrend)
+      return bullish ? TREND_STRONG_UP : TREND_STRONG_DOWN;
+
+   return bullish ? TREND_WEAK_UP : TREND_WEAK_DOWN;
+  }
+
+//+------------------------------------------------------------------+
+//| CHECK VOLUME CONFIRMATION                                         |
+//+------------------------------------------------------------------+
+double GetVolumeRatio()
+  {
+   if(!InpUseVolumeConfirm)
+      return 1.5;  // Always pass if disabled
+
+   MqlRates rates[];
+   int need = InpVolumeLookback + 5;
+   if(!SafeCopyRates(rates, 0, need))
+      return 0;
+
+   int rSize = ArraySize(rates);
+   if(rSize < InpVolumeLookback + 2)
+      return 0;
+
+   // Calculate average volume
+   double sumVol = 0;
+   for(int i = 2; i < InpVolumeLookback + 2 && i < rSize; i++)
+      sumVol += (double)rates[i].tick_volume;
+
+   double avgVol = sumVol / (double)InpVolumeLookback;
+   if(avgVol <= 0)
+      return 0;
+
+   g_volumeRatio = (double)rates[1].tick_volume / avgVol;
+   return g_volumeRatio;
+  }
+
+//+------------------------------------------------------------------+
+//| GET MOMENTUM VALUE                                                |
+//+------------------------------------------------------------------+
+double GetMomentum()
+  {
+   if(!InpUseMomentum)
+      return 0;
+
+   MqlRates rates[];
+   int need = InpMomentumPeriod + 5;
+   if(!SafeCopyRates(rates, 0, need))
+      return 0;
+
+   int rSize = ArraySize(rates);
+   if(rSize < InpMomentumPeriod + 2)
+      return 0;
+
+   // Rate of Change
+   if(rates[1 + InpMomentumPeriod].close <= 0)
+      return 0;
+
+   g_momentumValue = ((rates[1].close - rates[1 + InpMomentumPeriod].close) /
+                       rates[1 + InpMomentumPeriod].close) * 100.0;
+   return g_momentumValue;
+  }
+
+//+------------------------------------------------------------------+
+//| DETECT MARKET STRUCTURE (Higher Highs / Lower Lows)               |
+//+------------------------------------------------------------------+
+int DetectMarketStructure()
+  {
+   if(!InpUseStructure)
+      return 0;
+
+   MqlRates rates[];
+   int need = InpStructureLookback + 5;
+   if(!SafeCopyRates(rates, 0, need))
+      return 0;
+
+   int rSize = ArraySize(rates);
+   if(rSize < 20)
+      return 0;
+
+   // Find swing points (simple pivot detection)
+   double swHighs[];
+   double swLows[];
+   int    swHighCount = 0;
+   int    swLowCount  = 0;
+
+   ArrayResize(swHighs, 0);
+   ArrayResize(swLows, 0);
+
+   int lookLeft  = 3;
+   int lookRight = 3;
+
+   for(int i = lookRight + 1; i < rSize - lookLeft - 1 && i < InpStructureLookback; i++)
+     {
+      bool isSwingHigh = true;
+      bool isSwingLow  = true;
+
+      for(int j = 1; j <= lookLeft; j++)
+        {
+         if(i + j >= rSize) { isSwingHigh = false; isSwingLow = false; break; }
+         if(rates[i].high <= rates[i + j].high) isSwingHigh = false;
+         if(rates[i].low >= rates[i + j].low)   isSwingLow = false;
+        }
+      for(int j = 1; j <= lookRight; j++)
+        {
+         if(i - j < 0) { isSwingHigh = false; isSwingLow = false; break; }
+         if(rates[i].high <= rates[i - j].high) isSwingHigh = false;
+         if(rates[i].low >= rates[i - j].low)   isSwingLow = false;
+        }
+
+      if(isSwingHigh)
+        {
+         swHighCount++;
+         ArrayResize(swHighs, swHighCount);
+         swHighs[swHighCount - 1] = rates[i].high;
+        }
+      if(isSwingLow)
+        {
+         swLowCount++;
+         ArrayResize(swLows, swLowCount);
+         swLows[swLowCount - 1] = rates[i].low;
+        }
+     }
+
+   // Analyze structure: need at least 2 swing points each
+   if(swHighCount < 2 || swLowCount < 2)
+      return 0;
+
+   // swHighs[0] is most recent swing high, swHighs[1] is previous
+   bool higherHighs = (swHighs[0] > swHighs[1]);
+   bool higherLows  = (swLows[0] > swLows[1]);
+   bool lowerHighs  = (swHighs[0] < swHighs[1]);
+   bool lowerLows   = (swLows[0] < swLows[1]);
+
+   if(higherHighs && higherLows)
+     {
+      g_structureDir = 1;   // Bullish structure
+      return 1;
+     }
+   if(lowerHighs && lowerLows)
+     {
+      g_structureDir = -1;  // Bearish structure
+      return -1;
+     }
+
+   g_structureDir = 0;
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| HIGHER TIMEFRAME TREND CHECK                                      |
+//+------------------------------------------------------------------+
+int GetHTFTrend()
+  {
+   if(!InpUseMultiTF)
+      return 0;  // Neutral = no filter
+
+   double htfRSI[];
+   if(!SafeCopyBuffer(g_hHTF_RSI, 0, 1, 3, htfRSI))
+      return 0;
+
+   if(ArraySize(htfRSI) < 2)
+      return 0;
+
+   // Simple HTF trend: RSI above 50 = bullish bias, below 50 = bearish bias
+   if(htfRSI[0] > 55)
+      return 1;
+   if(htfRSI[0] < 45)
+      return -1;
+
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| CONFLUENCE-BASED SIGNAL GENERATION                                |
+//+------------------------------------------------------------------+
+int GetSignal()
+  {
+   int minBars = InpCEPeriod;
+   if(InpZLSMAPeriod > minBars) minBars = InpZLSMAPeriod;
+   if(InpStructureLookback > minBars) minBars = InpStructureLookback;
+   int needBars = minBars * 3 + 50;
+
+   MqlRates rates[];
+   if(!SafeCopyRates(rates, 0, needBars))
+      return 0;
+
+   int ratesSize = ArraySize(rates);
+   if(ratesSize < 10)
+      return 0;
+
+   //--- Build Heikin Ashi cache
+   if(InpUseHeikinAshi)
+     {
+      if(!BuildHeikinAshiCache(needBars))
+         return 0;
+     }
+
+   //--- RSI
+   double rsi[];
+   if(!SafeCopyBuffer(g_hRSI, 0, 0, 5, rsi))
+      return 0;
+   if(ArraySize(rsi) < 4)
+      return 0;
+
+   //--- Bollinger Bands
+   double bbUpper[], bbMiddle[], bbLower[];
+   if(!SafeCopyBuffer(g_hBB, 1, 0, 5, bbUpper))   return 0;
+   if(!SafeCopyBuffer(g_hBB, 0, 0, 5, bbMiddle))  return 0;
+   if(!SafeCopyBuffer(g_hBB, 2, 0, 5, bbLower))   return 0;
+   if(ArraySize(bbUpper) < 3 || ArraySize(bbLower) < 3)
+      return 0;
+
+   //--- Chandelier Exit
+   if(!CalcChandelierExit())
+      return 0;
+
+   //--- ZLSMA (3 bars for slope analysis)
+   g_zlsma1 = CalcZLSMA(1);
+   g_zlsma2 = CalcZLSMA(2);
+   g_zlsma3 = CalcZLSMA(3);
+   if(g_zlsma1 == 0 || g_zlsma2 == 0 || g_zlsma3 == 0)
+      return 0;
+
+   //--- Volatility regime
+   g_volRegime = DetectVolatilityRegime();
+
+   //--- Trend state
+   g_trendState = DetectTrendState();
+
+   //--- Market structure
+   int structure = DetectMarketStructure();
+
+   //--- Volume
+   double volRatio = GetVolumeRatio();
+
+   //--- Momentum
+   double momentum = GetMomentum();
+
+   //--- HTF trend
+   int htfTrend = GetHTFTrend();
+
+   //--- Price data
+   double close1 = 0, close2 = 0, close3 = 0;
+   double open1 = 0, open2 = 0;
+   double high1 = 0, low1 = 0;
+
+   if(InpUseHeikinAshi && ArraySize(g_haClose) >= 4)
+     {
+      close1 = g_haClose[1]; close2 = g_haClose[2]; close3 = g_haClose[3];
+      open1  = g_haOpen[1];  open2  = g_haOpen[2];
+      high1  = g_haHigh[1];  low1   = g_haLow[1];
+     }
+   else
+     {
+      close1 = rates[1].close; close2 = rates[2].close; close3 = rates[3].close;
+      open1  = rates[1].open;  open2  = rates[2].open;
+      high1  = rates[1].high;  low1   = rates[1].low;
+     }
+
+   if(close1 == 0 || close2 == 0 || open1 == 0)
+      return 0;
+
+   //=================================================================
+   // CONFLUENCE SCORING SYSTEM
+   // Each factor adds to the score. Minimum score required to trade.
+   //=================================================================
+   int buyScore  = 0;
+   int sellScore = 0;
+   g_signalDetails = "";
+
+   //--- Factor 1: Chandelier Exit Direction + Transition (weight: 1-2)
+   bool ceTurnedBull = (g_ceDir == 1 && g_prevCeDir == -1);
+   bool ceTurnedBear = (g_ceDir == -1 && g_prevCeDir == 1);
+
+   if(ceTurnedBull)
+     {
+      buyScore += 2;
+      g_signalDetails += "CE_FLIP+ ";
+     }
+   else if(g_ceDir == 1)
+     {
+      buyScore += 1;
+      g_signalDetails += "CE+ ";
+     }
+
+   if(ceTurnedBear)
+     {
+      sellScore += 2;
+      g_signalDetails += "CE_FLIP- ";
+     }
+   else if(g_ceDir == -1)
+     {
+      sellScore += 1;
+      g_signalDetails += "CE- ";
+     }
+
+   //--- Factor 2: ZLSMA Trend + Slope (weight: 1-2)
+   double zlsmaSlope1 = g_zlsma1 - g_zlsma2;
+   double zlsmaSlope2 = g_zlsma2 - g_zlsma3;
+   bool   zlsmaAccelUp   = (zlsmaSlope1 > 0 && zlsmaSlope1 > zlsmaSlope2);
+   bool   zlsmaAccelDown = (zlsmaSlope1 < 0 && zlsmaSlope1 < zlsmaSlope2);
+
+   if(close1 > g_zlsma1 && g_zlsma1 > g_zlsma2)
+     {
+      buyScore += 1;
+      g_signalDetails += "ZL+ ";
+      if(zlsmaAccelUp)
+        {
+         buyScore += 1;
+         g_signalDetails += "ZLaccel+ ";
+        }
+     }
+
+   if(close1 < g_zlsma1 && g_zlsma1 < g_zlsma2)
+     {
+      sellScore += 1;
+      g_signalDetails += "ZL- ";
+      if(zlsmaAccelDown)
+        {
+         sellScore += 1;
+         g_signalDetails += "ZLaccel- ";
+        }
+     }
+
+   //--- Factor 3: Candle Pattern (weight: 1)
+   bool bullCandle = (close1 > open1);
+   bool bearCandle = (close1 < open1);
+
+   // Enhanced: check candle body strength
+   double bodySize = MathAbs(close1 - open1);
+   double wickSize = high1 - low1;
+   bool   strongBullCandle = bullCandle && (wickSize > 0) && (bodySize / wickSize > 0.5);
+   bool   strongBearCandle = bearCandle && (wickSize > 0) && (bodySize / wickSize > 0.5);
+
+   if(strongBullCandle)
+     {
+      buyScore += 1;
+      g_signalDetails += "CANDLE+ ";
+     }
+   else if(bullCandle)
+     {
+      // Weak candle - still count but less
+      buyScore += 1;
+     }
+
+   if(strongBearCandle)
+     {
+      sellScore += 1;
+      g_signalDetails += "CANDLE- ";
+     }
+   else if(bearCandle)
+     {
+      sellScore += 1;
+     }
+
+   //--- Factor 4: RSI (weight: 1)
+   if(InpUseRSIFilter)
+     {
+      // RSI confirms direction without being overbought/oversold against us
+      if(rsi[1] > 50 && rsi[1] < InpRSIOverbought)
+        {
+         buyScore += 1;
+         g_signalDetails += "RSI+ ";
+        }
+      if(rsi[1] < 50 && rsi[1] > InpRSIOversold)
+        {
+         sellScore += 1;
+         g_signalDetails += "RSI- ";
+        }
+
+      // RSI divergence / reversal from extremes (bonus signal)
+      if(rsi[2] < InpRSIOversold && rsi[1] > InpRSIOversold)
+        {
+         buyScore += 1;
+         g_signalDetails += "RSI_REV+ ";
+        }
+      if(rsi[2] > InpRSIOverbought && rsi[1] < InpRSIOverbought)
+        {
+         sellScore += 1;
+         g_signalDetails += "RSI_REV- ";
+        }
+
+      // PENALTY: Trading into extreme RSI
+      if(rsi[1] >= InpRSIOverbought)
+        {
+         buyScore -= 2;
+         g_signalDetails += "RSI_OB! ";
+        }
+      if(rsi[1] <= InpRSIOversold)
+        {
+         sellScore -= 2;
+         g_signalDetails += "RSI_OS! ";
+        }
+     }
+
+   //--- Factor 5: Bollinger Bands (weight: 1)
+   if(InpUseBBFilter)
+     {
+      // Price near lower band = buy opportunity
+      if(close1 <= bbLower[1] || (close2 < bbLower[2] && close1 > bbLower[1]))
+        {
+         buyScore += 1;
+         g_signalDetails += "BB+ ";
+        }
+      // Price near upper band = sell opportunity
+      if(close1 >= bbUpper[1] || (close2 > bbUpper[2] && close1 < bbUpper[1]))
+        {
+         sellScore += 1;
+         g_signalDetails += "BB- ";
+        }
+
+      // PENALTY: Breakout against position
+      if(close1 > bbUpper[1] && close2 > bbUpper[2])
+         sellScore -= 1;
+      if(close1 < bbLower[1] && close2 < bbLower[2])
+         buyScore -= 1;
+     }
+
+   //--- Factor 6: ADX / Trend Strength (weight: 1)
+   if(InpUseADXFilter)
+     {
+      if(g_trendState == TREND_STRONG_UP || g_trendState == TREND_WEAK_UP)
+        {
+         buyScore += 1;
+         g_signalDetails += "ADX+ ";
+        }
+      if(g_trendState == TREND_STRONG_DOWN || g_trendState == TREND_WEAK_DOWN)
+        {
+         sellScore += 1;
+         g_signalDetails += "ADX- ";
+        }
+
+      // PENALTY: Trading against strong trend
+      if(g_trendState == TREND_STRONG_UP)
+         sellScore -= 1;
+      if(g_trendState == TREND_STRONG_DOWN)
+         buyScore -= 1;
+
+      // PENALTY: No trend (ranging) - reduce confidence
+      if(g_trendState == TREND_RANGING)
+        {
+         buyScore  -= 1;
+         sellScore -= 1;
+         g_signalDetails += "RANGE! ";
+        }
+     }
+
+   //--- Factor 7: Volume Confirmation (weight: 1)
+   if(InpUseVolumeConfirm)
+     {
+      if(volRatio >= InpVolumeMinMult)
+        {
+         if(buyScore > sellScore)
+           {
+            buyScore += 1;
+            g_signalDetails += "VOL+ ";
+           }
+         else if(sellScore > buyScore)
+           {
+            sellScore += 1;
+            g_signalDetails += "VOL- ";
+           }
+        }
+      else if(volRatio < 0.7)
+        {
+         // Low volume - reduce confidence
+         buyScore  -= 1;
+         sellScore -= 1;
+         g_signalDetails += "LOWVOL! ";
+        }
+     }
+
+   //--- Factor 8: Momentum (weight: 1)
+   if(InpUseMomentum)
+     {
+      if(momentum > 0.1)
+        {
+         buyScore += 1;
+         g_signalDetails += "MOM+ ";
+        }
+      if(momentum < -0.1)
+        {
+         sellScore += 1;
+         g_signalDetails += "MOM- ";
+        }
+     }
+
+   //--- Factor 9: Market Structure (weight: 1)
+   if(InpUseStructure)
+     {
+      if(structure == 1)
+        {
+         buyScore += 1;
+         g_signalDetails += "STRUCT+ ";
+        }
+      if(structure == -1)
+        {
+         sellScore += 1;
+         g_signalDetails += "STRUCT- ";
+        }
+     }
+
+   //--- Factor 10: Higher Timeframe (weight: 1)
+   if(InpUseMultiTF)
+     {
+      if(htfTrend == 1)
+        {
+         buyScore += 1;
+         sellScore -= 1;
+         g_signalDetails += "HTF+ ";
+        }
+      if(htfTrend == -1)
+        {
+         sellScore += 1;
+         buyScore -= 1;
+         g_signalDetails += "HTF- ";
+        }
+     }
+
+   //--- Volatility regime adjustments
+   if(g_volRegime == VOL_EXTREME)
+     {
+      // Reduce all signals in extreme volatility
+      buyScore  -= 1;
+      sellScore -= 1;
+      g_signalDetails += "EXTVOL! ";
+     }
+   else if(g_volRegime == VOL_LOW)
+     {
+      // Low volatility - less reliable signals
+      buyScore  -= 1;
+      sellScore -= 1;
+      g_signalDetails += "LOWVOL_R! ";
+     }
+
+   //--- Floor at zero
+   if(buyScore < 0)  buyScore = 0;
+   if(sellScore < 0) sellScore = 0;
+
+   //--- Store confluence score
+   g_confluenceScore = MathMax(buyScore, sellScore);
+   g_lastConfluence  = g_confluenceScore;
+
+   //--- Determine signal
+   int signal = 0;
+
+   if(buyScore >= InpMinConfluence && buyScore > sellScore)
+      signal = 1;
+   else if(sellScore >= InpMinConfluence && sellScore > buyScore)
+      signal = -1;
+
+   // Conflicting signals cancel out
+   if(buyScore >= InpMinConfluence && sellScore >= InpMinConfluence)
+     {
+      if(MathAbs(buyScore - sellScore) < 2)
+         signal = 0;  // Too close - no trade
+     }
+
+   //--- Reverse if enabled
+   if(InpReverseSignal && signal != 0)
+      signal = -signal;
+
+   return signal;
+  }
+
+//+------------------------------------------------------------------+
+//| CALCULATE LOT SIZE                                                |
+//+------------------------------------------------------------------+
+double CalcLotSize(double slPoints)
+  {
+   symInfo.Name(_Symbol);
+   symInfo.RefreshRates();
+
+   double tickValue = symInfo.TickValue();
+   double tickSize  = symInfo.TickSize();
+   double point     = symInfo.Point();
+   double minLot    = symInfo.LotsMin();
+   double maxLot    = symInfo.LotsMax();
+   double lotStep   = symInfo.LotsStep();
+   double lotSize   = minLot;
+
+   if(tickValue <= 0 || tickSize <= 0 || point <= 0 || lotStep <= 0)
+      return minLot;
+
+   switch(InpRiskMode)
+     {
+      case RISK_FIXED_LOT:
+         lotSize = InpRiskValue;
+         break;
+
+      case RISK_PERCENT_BALANCE:
+        {
+         double riskAmount = accInfo.Balance() * InpRiskValue / 100.0;
+         if(slPoints > 0)
+            lotSize = riskAmount / ((slPoints * point / tickSize) * tickValue);
+         else
+            lotSize = minLot;
+        }
+      break;
+
+      case RISK_PERCENT_EQUITY:
+        {
+         double riskAmount = accInfo.Equity() * InpRiskValue / 100.0;
+         if(slPoints > 0)
+            lotSize = riskAmount / ((slPoints * point / tickSize) * tickValue);
+         else
+            lotSize = minLot;
+        }
+      break;
+     }
+
+   // Volatility-based lot reduction
+   if(InpUseVolatilityAdapt)
+     {
+      if(g_volRegime == VOL_HIGH)
+         lotSize *= 0.75;
+      else if(g_volRegime == VOL_EXTREME)
+         lotSize *= 0.5;
+     }
+
+   if(lotSize < minLot) lotSize = minLot;
+   if(lotSize > maxLot) lotSize = maxLot;
+   lotSize = MathFloor(lotSize / lotStep) * lotStep;
+   lotSize = NormalizeDouble(lotSize, 2);
+   if(lotSize < minLot) lotSize = minLot;
+
+   return lotSize;
+  }
+
+//+------------------------------------------------------------------+
+//| CALCULATE STOP LOSS                                               |
+//+------------------------------------------------------------------+
+double CalcStopLoss(bool isBuy)
+  {
+   symInfo.Name(_Symbol);
+   symInfo.RefreshRates();
+
+   double point  = symInfo.Point();
+   int    digits = (int)symInfo.Digits();
+   double price  = isBuy ? symInfo.Ask() : symInfo.Bid();
+   double sl     = 0;
+
+   if(point <= 0 || price <= 0)
+      return 0;
+
+   switch(InpSLType)
+     {
+      case SL_FIXED_POINTS:
+         sl = isBuy ? price - InpSLFixedPoints * point : price + InpSLFixedPoints * point;
+         break;
+
+      case SL_ATR_BASED:
+        {
+         double atrBuf[];
+         if(SafeCopyBuffer(g_hATR, 0, 1, 1, atrBuf) && ArraySize(atrBuf) >= 1 && atrBuf[0] > 0)
+           {
+            double atrSL = atrBuf[0] * InpATRMultSL;
+
+            // Adapt ATR multiplier to volatility regime
+            if(InpUseVolatilityAdapt)
+              {
+               if(g_volRegime == VOL_HIGH)
+                  atrSL *= 1.3;
+               else if(g_volRegime == VOL_EXTREME)
+                  atrSL *= 1.6;
+               else if(g_volRegime == VOL_LOW)
+                  atrSL *= 0.8;
+              }
+
+            sl = isBuy ? price - atrSL - InpSLDeviation * point
+                 : price + atrSL + InpSLDeviation * point;
+           }
+         else
+            sl = isBuy ? price - InpSLFixedPoints * point : price + InpSLFixedPoints * point;
+        }
+      break;
+
+      case SL_SWING_HIGH_LOW:
+        {
+         int need = InpSLLookback + 2;
+         MqlRates swRates[];
+         if(SafeCopyRates(swRates, 1, need) && ArraySize(swRates) >= InpSLLookback)
+           {
+            int swSize = ArraySize(swRates);
+            if(isBuy)
+              {
+               double lowestLow = DBL_MAX;
+               for(int i = 0; i < InpSLLookback && i < swSize; i++)
+                  if(swRates[i].low < lowestLow) lowestLow = swRates[i].low;
+               if(lowestLow < DBL_MAX)
+                  sl = lowestLow - InpSLDeviation * point;
+              }
+            else
+              {
+               double highestHigh = -DBL_MAX;
+               for(int i = 0; i < InpSLLookback && i < swSize; i++)
+                  if(swRates[i].high > highestHigh) highestHigh = swRates[i].high;
+               if(highestHigh > -DBL_MAX)
+                  sl = highestHigh + InpSLDeviation * point;
+              }
+           }
+
+         if(sl <= 0)
+            sl = isBuy ? price - InpSLFixedPoints * point : price + InpSLFixedPoints * point;
+        }
+      break;
+
+      case SL_CHANDELIER:
+        {
+         if(g_ceLongStop > 0 && g_ceShortStop > 0)
+            sl = isBuy ? g_ceLongStop - InpSLDeviation * point
+                 : g_ceShortStop + InpSLDeviation * point;
+         else
+            sl = isBuy ? price - InpSLFixedPoints * point : price + InpSLFixedPoints * point;
+        }
+      break;
+     }
+
+   if(sl <= 0)
+      sl = isBuy ? price - InpSLFixedPoints * point : price + InpSLFixedPoints * point;
+
+   return NormalizeDouble(sl, digits);
+  }
+
+//+------------------------------------------------------------------+
+//| CALCULATE ADAPTIVE TAKE PROFIT                                    |
+//+------------------------------------------------------------------+
+double CalcTakeProfit(bool isBuy, double price, double sl)
+  {
+   if(InpTPCoefficient <= 0 || sl <= 0 || price <= 0)
+      return 0;
+
+   symInfo.Name(_Symbol);
+   int digits = (int)symInfo.Digits();
+
+   double slDist = MathAbs(price - sl);
+   double tpCoeff = InpTPCoefficient;
+
+   // Adaptive TP based on conditions
+   if(InpAdaptiveTP)
+     {
+      // Strong trend = wider TP
+      if(g_trendState == TREND_STRONG_UP || g_trendState == TREND_STRONG_DOWN)
+         tpCoeff *= 1.5;
+      // Weak trend = tighter TP
+      else if(g_trendState == TREND_WEAK_UP || g_trendState == TREND_WEAK_DOWN)
+         tpCoeff *= 1.0;
+      // Ranging = tighter TP (take what you can)
+      else if(g_trendState == TREND_RANGING)
+         tpCoeff *= 0.75;
+
+      // High confluence = wider TP (more confident)
+      if(g_confluenceScore >= 5)
+         tpCoeff *= 1.2;
+
+      // Volatility adjustment
+      if(g_volRegime == VOL_HIGH)
+         tpCoeff *= 1.2;
+      else if(g_volRegime == VOL_LOW)
+         tpCoeff *= 0.8;
+     }
+
+   double tp = 0;
+   if(isBuy)
+      tp = price + tpCoeff * slDist;
+   else
+      tp = price - tpCoeff * slDist;
+
+   return NormalizeDouble(tp, digits);
+  }
+
+//+------------------------------------------------------------------+
+//| COUNT POSITIONS                                                   |
+//+------------------------------------------------------------------+
+int CountPositions(int direction = 0)
+  {
+   int count = 0;
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+           {
+            if(direction == 0)
+               count++;
+            else if(direction == 1 && posInfo.PositionType() == POSITION_TYPE_BUY)
+               count++;
+            else if(direction == -1 && posInfo.PositionType() == POSITION_TYPE_SELL)
+               count++;
+           }
+        }
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| GET TOTAL PROFIT                                                  |
+//+------------------------------------------------------------------+
+double GetTotalProfit()
+  {
+   double profit = 0;
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+            profit += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+        }
+     }
+   return profit;
+  }
+
+//+------------------------------------------------------------------+
+//| GET LAST ENTRY PRICE FOR GRID                                     |
+//+------------------------------------------------------------------+
+double GetLastEntryPrice(ENUM_POSITION_TYPE type)
+  {
+   datetime latestTime = 0;
+   double   lastPrice  = 0;
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol && posInfo.PositionType() == type)
+           {
+            if(posInfo.Time() > latestTime)
+              {
+               latestTime = posInfo.Time();
+               lastPrice  = posInfo.PriceOpen();
+              }
+           }
+        }
+     }
+   return lastPrice;
+  }
+
+//+------------------------------------------------------------------+
+//| GET AVERAGE ENTRY PRICE                                           |
+//+------------------------------------------------------------------+
+double GetAverageEntryPrice(ENUM_POSITION_TYPE type)
+  {
+   double totalLots  = 0;
+   double weightedPrice = 0;
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol && posInfo.PositionType() == type)
+           {
+            weightedPrice += posInfo.PriceOpen() * posInfo.Volume();
+            totalLots     += posInfo.Volume();
+           }
+        }
+     }
+   if(totalLots <= 0)
+      return 0;
+   return weightedPrice / totalLots;
+  }
+
+//+------------------------------------------------------------------+
+//| GET GRID LEVEL COUNT                                              |
+//+------------------------------------------------------------------+
+int GetGridLevel(ENUM_POSITION_TYPE type)
+  {
+   int count = 0;
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol && posInfo.PositionType() == type)
+            count++;
+        }
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| CALCULATE GRID LOT SIZE                                           |
+//+------------------------------------------------------------------+
+double CalcGridLots(int level)
+  {
+   symInfo.Name(_Symbol);
+   symInfo.RefreshRates();
+
+   double baseLots = CalcLotSize(InpSLFixedPoints > 0 ? (double)InpSLFixedPoints : 200.0);
+   double gridLots = baseLots;
+   double minLot   = symInfo.LotsMin();
+   double maxLot   = symInfo.LotsMax();
+   double lotStep  = symInfo.LotsStep();
+
+   double mult = InpGridVolMultiplier;
+   if(mult <= 0) mult = 1.0;
+
+   switch(InpGridMode)
+     {
+      case GRID_SAME_DIRECTION:
+         gridLots = baseLots * mult;
+         break;
+      case GRID_MARTINGALE:
+        {
+         double mMult = mult > 1.0 ? mult : 1.5;
+         gridLots = baseLots * MathPow(mMult, (double)level);
+        }
+      break;
+      case GRID_ANTI_MARTINGALE:
+        {
+         double aMult = mult > 1.0 ? mult : 1.5;
+         gridLots = level > 0 ? baseLots / MathPow(aMult, (double)level) : baseLots;
+        }
+      break;
+      default:
+         gridLots = baseLots;
+         break;
+     }
+
+   if(gridLots < minLot) gridLots = minLot;
+   if(gridLots > maxLot) gridLots = maxLot;
+   if(lotStep > 0) gridLots = MathFloor(gridLots / lotStep) * lotStep;
+   if(gridLots < minLot) gridLots = minLot;
+
+   return NormalizeDouble(gridLots, 2);
+  }
+
+//+------------------------------------------------------------------+
+//| OPEN TRADE                                                        |
+//+------------------------------------------------------------------+
+bool OpenTrade(int signal)
+  {
+   if(!InpAllowNewPos)
+      return false;
+   if(CountPositions() >= InpMaxPositions)
+      return false;
+
+   symInfo.Name(_Symbol);
+   symInfo.RefreshRates();
+
+   if(InpSpreadLimit >= 0 && (int)symInfo.Spread() > InpSpreadLimit)
+      return false;
+
+   if(InpMarginLevelLimit > 0 && PositionsTotal() > 0)
+     {
+      double ml = accInfo.MarginLevel();
+      if(ml > 0 && ml < InpMarginLevelLimit)
+         return false;
+     }
+
+   bool   isBuy  = (signal == 1);
+   double price  = isBuy ? symInfo.Ask() : symInfo.Bid();
+   int    digits = (int)symInfo.Digits();
+   double point  = symInfo.Point();
+   double sl     = CalcStopLoss(isBuy);
+
+   if(sl <= 0 || price <= 0 || point <= 0)
+      return false;
+
+   double slDist = MathAbs(price - sl) / point;
+   double tp     = CalcTakeProfit(isBuy, price, sl);
+   double lots   = CalcLotSize(slDist);
+
+   price = NormalizeDouble(price, digits);
+   sl    = NormalizeDouble(sl, digits);
+   if(tp > 0) tp = NormalizeDouble(tp, digits);
+
+   string comment = StringFormat("%s|C%d", InpEAComment, g_confluenceScore);
+
+   bool result = false;
+   if(isBuy)
+      result = trade.Buy(lots, _Symbol, price, sl, tp, comment);
+   else
+      result = trade.Sell(lots, _Symbol, price, sl, tp, comment);
+
+   if(result)
+      PrintFormat("[TRADE] %s | Price: %.5f | SL: %.5f | TP: %.5f | Lots: %.2f | Confluence: %d | %s",
+                  isBuy ? "BUY" : "SELL", price, sl, tp, lots, g_confluenceScore, g_signalDetails);
+   else
+      PrintFormat("[ERROR] Trade failed: %d - %s", GetLastError(), trade.ResultComment());
+
+   return result;
+  }
+
+//+------------------------------------------------------------------+
+//| SMART GRID: Check if price is at a value zone for grid entry      |
+//+------------------------------------------------------------------+
+bool IsGridValueZone(bool isBuy)
+  {
+   if(!InpGridSmartEntry)
+      return true;  // Always allow if smart entry disabled
+
+   // Check if price has pulled back to a meaningful level
+   double rsi[];
+   if(!SafeCopyBuffer(g_hRSI, 0, 1, 2, rsi) || ArraySize(rsi) < 2)
+      return true;
+
+   if(isBuy)
+     {
+      // For buy grid: add when RSI shows oversold or neutral (not overbought)
+      return (rsi[0] < 60);
+     }
+   else
+     {
+      // For sell grid: add when RSI shows overbought or neutral (not oversold)
+      return (rsi[0] > 40);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| GRID MANAGEMENT                                                   |
+//+------------------------------------------------------------------+
+void ManageGrid()
+  {
+   if(InpGridMode == GRID_DISABLED)
+      return;
+
+   symInfo.Name(_Symbol);
+   symInfo.RefreshRates();
+
+   double point = symInfo.Point();
+   if(point <= 0) return;
+
+   int digits = (int)symInfo.Digits();
+
+   // Grid step calculation
+   double gridStep = 0;
+   if(InpGridStepPoints > 0)
+     {
+      gridStep = (double)InpGridStepPoints * point;
+     }
+   else
+     {
+      double atrBuf[];
+      if(SafeCopyBuffer(g_hATR, 0, 1, 1, atrBuf) && ArraySize(atrBuf) >= 1 && atrBuf[0] > 0)
+        {
+         gridStep = atrBuf[0] * InpGridATRMultStep;
+         // Adapt grid step to volatility
+         if(InpUseVolatilityAdapt)
+           {
+            if(g_volRegime == VOL_HIGH)
+               gridStep *= 1.3;
+            else if(g_volRegime == VOL_EXTREME)
+               gridStep *= 1.8;
+            else if(g_volRegime == VOL_LOW)
+               gridStep *= 0.7;
+           }
+        }
+      else
+         gridStep = 200.0 * point;
+     }
+
+   if(gridStep <= 0) return;
+
+   // BUY GRID
+   int buyCount = GetGridLevel(POSITION_TYPE_BUY);
+   if(buyCount > 0 && buyCount < InpGridMaxLevels && CountPositions() < InpMaxPositions)
+     {
+      double lastPrice    = GetLastEntryPrice(POSITION_TYPE_BUY);
+      double currentPrice = symInfo.Ask();
+
+      if(lastPrice > 0 && currentPrice > 0 && (lastPrice - currentPrice) >= gridStep)
+        {
+         if(IsGridValueZone(true))
+           {
+            double gridLots = CalcGridLots(buyCount);
+            double sl       = CalcStopLoss(true);
+            double tp       = 0;
+
+            if(InpGridTPPoints > 0)
+               tp = currentPrice + InpGridTPPoints * point;
+
+            currentPrice = NormalizeDouble(currentPrice, digits);
+            sl           = NormalizeDouble(sl, digits);
+            if(tp > 0) tp = NormalizeDouble(tp, digits);
+
+            string comment = StringFormat("%s_G%d", InpEAComment, buyCount + 1);
+            if(trade.Buy(gridLots, _Symbol, currentPrice, sl, tp, comment))
+               PrintFormat("[GRID] BUY Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f",
+                           buyCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_BUY));
+           }
+        }
+     }
+
+   // SELL GRID
+   int sellCount = GetGridLevel(POSITION_TYPE_SELL);
+   if(sellCount > 0 && sellCount < InpGridMaxLevels && CountPositions() < InpMaxPositions)
+     {
+      double lastPrice    = GetLastEntryPrice(POSITION_TYPE_SELL);
+      double currentPrice = symInfo.Bid();
+
+      if(lastPrice > 0 && currentPrice > 0 && (currentPrice - lastPrice) >= gridStep)
+        {
+         if(IsGridValueZone(false))
+           {
+            double gridLots = CalcGridLots(sellCount);
+            double sl       = CalcStopLoss(false);
+            double tp       = 0;
+
+            if(InpGridTPPoints > 0)
+               tp = currentPrice - InpGridTPPoints * point;
+
+            currentPrice = NormalizeDouble(currentPrice, digits);
+            sl           = NormalizeDouble(sl, digits);
+            if(tp > 0) tp = NormalizeDouble(tp, digits);
+
+            string comment = StringFormat("%s_G%d", InpEAComment, sellCount + 1);
+            if(trade.Sell(gridLots, _Symbol, currentPrice, sl, tp, comment))
+               PrintFormat("[GRID] SELL Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f",
+                           sellCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_SELL));
+           }
+        }
+     }
+
+   // BASKET CLOSE
+   if(InpGridBasketClose && CountPositions() > 0)
+     {
+      double totalProfit = GetTotalProfit();
+      double basketTP    = InpGridBasketTP;
+
+      if(basketTP <= 0)
+        {
+         double bal = accInfo.Balance();
+         basketTP = (bal > 0) ? bal * 0.005 : 10.0;
+
+         // Scale basket TP with grid levels
+         int totalGridLevels = GetGridLevel(POSITION_TYPE_BUY) + GetGridLevel(POSITION_TYPE_SELL);
+         if(totalGridLevels > 3)
+            basketTP *= (1.0 + (totalGridLevels - 3) * 0.1);
+        }
+
+      if(totalProfit >= basketTP)
+        {
+         CloseAllPositions();
+         PrintFormat("[BASKET] TP reached: $%.2f >= $%.2f", totalProfit, basketTP);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| TRAILING STOP MANAGEMENT                                          |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+  {
+   if(!InpUseTrailing && InpBreakEvenPoints <= 0)
+      return;
+
+   symInfo.Name(_Symbol);
+   symInfo.RefreshRates();
+
+   double point  = symInfo.Point();
+   int    digits = (int)symInfo.Digits();
+   if(point <= 0) return;
+
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != InpMagicNumber || posInfo.Symbol() != _Symbol) continue;
+
+      double openPrice = posInfo.PriceOpen();
+      double currentSL = posInfo.StopLoss();
+      double currentTP = posInfo.TakeProfit();
+      double spread    = (double)symInfo.Spread() * point;
+      ulong  ticket    = posInfo.Ticket();
+
+      if(posInfo.PositionType() == POSITION_TYPE_BUY)
+        {
+         double bid    = symInfo.Bid();
+         double profit = bid - openPrice;
+         if(profit <= 0) continue;
+
+         // Break Even
+         if(InpBreakEvenPoints > 0 && profit >= InpBreakEvenPoints * point)
+           {
+            double newSL = NormalizeDouble(openPrice + spread, digits);
+            if(currentSL < newSL)
+               trade.PositionModify(ticket, newSL, currentTP);
+           }
+
+         // Trailing
+         if(InpUseTrailing)
+           {
+            double trailDist = profit * (1.0 - InpTrailingLevel / 100.0);
+            if(trailDist > 0)
+              {
+               double newSL = NormalizeDouble(bid - trailDist, digits);
+               if(newSL > currentSL && newSL > openPrice)
+                  trade.PositionModify(ticket, newSL, currentTP);
+              }
+           }
+        }
+      else if(posInfo.PositionType() == POSITION_TYPE_SELL)
+        {
+         double ask    = symInfo.Ask();
+         double profit = openPrice - ask;
+         if(profit <= 0) continue;
+
+         // Break Even
+         if(InpBreakEvenPoints > 0 && profit >= InpBreakEvenPoints * point)
+           {
+            double newSL = NormalizeDouble(openPrice - spread, digits);
+            if(currentSL > newSL || currentSL == 0)
+               trade.PositionModify(ticket, newSL, currentTP);
+           }
+
+         // Trailing
+         if(InpUseTrailing)
+           {
+            double trailDist = profit * (1.0 - InpTrailingLevel / 100.0);
+            if(trailDist > 0)
+              {
+               double newSL = NormalizeDouble(ask + trailDist, digits);
+               if((newSL < currentSL || currentSL == 0) && newSL < openPrice)
+                  trade.PositionModify(ticket, newSL, currentTP);
+              }
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| EQUITY DRAWDOWN CHECK                                             |
+//+------------------------------------------------------------------+
+void CheckEquityDrawdown()
+  {
+   if(InpEquityDDLimit <= 0) return;
+
+   double equity  = accInfo.Equity();
+   double balance = accInfo.Balance();
+   if(balance <= 0) return;
+
+   double ddPercent = ((balance - equity) / balance) * 100.0;
+   if(ddPercent >= InpEquityDDLimit)
+     {
+      CloseAllPositions();
+      PrintFormat("[RISK] EQUITY DD: %.2f%% >= %.2f%%", ddPercent, InpEquityDDLimit);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| DAILY LOSS CHECK                                                  |
+//+------------------------------------------------------------------+
+void CheckDailyLoss()
+  {
+   if(InpMaxDailyLoss <= 0) return;
+
+   MqlDateTime dtNow;
+   TimeCurrent(dtNow);
+
+   string dayStr = IntegerToString(dtNow.year) + "." +
+                   IntegerToString(dtNow.mon, 2, '0') + "." +
+                   IntegerToString(dtNow.day, 2, '0');
+
+   datetime startOfDay = StringToTime(dayStr);
+   if(startOfDay != g_dailyResetTime)
+     {
+      g_dailyStartEquity = accInfo.Equity();
+      g_dailyResetTime   = startOfDay;
+     }
+
+   double dailyLoss = g_dailyStartEquity - accInfo.Equity();
+   if(dailyLoss >= InpMaxDailyLoss)
+     {
+      CloseAllPositions();
+      PrintFormat("[RISK] DAILY LOSS: $%.2f >= $%.2f", dailyLoss, InpMaxDailyLoss);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| TIME FILTER                                                       |
+//+------------------------------------------------------------------+
+bool IsWithinTradingTime()
+  {
+   if(!InpUseTimeFilter) return true;
+
+   MqlDateTime dtNow;
+   TimeCurrent(dtNow);
+
+   string dateStr = IntegerToString(dtNow.year) + "." +
+                    IntegerToString(dtNow.mon, 2, '0') + "." +
+                    IntegerToString(dtNow.day, 2, '0') + " ";
+
+   datetime startTime = StringToTime(dateStr + InpTradingStartTime);
+   datetime endTime   = StringToTime(dateStr + InpTradingEndTime);
+   datetime now       = TimeCurrent();
+
+   return (now >= startTime && now <= endTime);
+  }
+
+//+------------------------------------------------------------------+
+//| FRIDAY CLOSE                                                      |
+//+------------------------------------------------------------------+
+void CheckFridayClose()
+  {
+   if(!InpCloseFriday) return;
+
+   MqlDateTime dtNow;
+   TimeCurrent(dtNow);
+   if(dtNow.day_of_week != 5) return;
+
+   string dateStr = IntegerToString(dtNow.year) + "." +
+                    IntegerToString(dtNow.mon, 2, '0') + "." +
+                    IntegerToString(dtNow.day, 2, '0') + " ";
+
+   datetime closeTime = StringToTime(dateStr + InpFridayCloseTime);
+
+   if(TimeCurrent() >= closeTime && CountPositions() > 0)
+     {
+      CloseAllPositions();
+      Print("[TIME] Friday close executed");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| CLOSE ALL POSITIONS                                               |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+  {
+   int attempt = 0;
+   while(attempt < 5)
+     {
+      bool allClosed = true;
+      int total = PositionsTotal();
+      for(int i = total - 1; i >= 0; i--)
+        {
+         if(posInfo.SelectByIndex(i))
+           {
+            if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+              {
+               if(!trade.PositionClose(posInfo.Ticket(), InpSlippage))
+                  allClosed = false;
+              }
+           }
+        }
+      if(allClosed || CountPositions() == 0) break;
+      Sleep(300);
+      attempt++;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| CREATE LABEL                                                      |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, int x, int y, string text, color clr, int size)
+  {
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
+   ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+  }
+
+//+------------------------------------------------------------------+
+//| UPDATE PANEL                                                      |
+//+------------------------------------------------------------------+
+void UpdatePanel()
+  {
+   if(!InpShowPanel) return;
+
+   int x = 10, y = 30, fs = 9;
+
+   double totalProfit = GetTotalProfit();
+   double equity      = accInfo.Equity();
+   double balance     = accInfo.Balance();
+   double marginLevel = accInfo.MarginLevel();
+   int    totalPos    = CountPositions();
+   int    buyPos      = CountPositions(1);
+   int    sellPos     = CountPositions(-1);
+
+   color hdrClr = clrGold;
+   color txtClr = clrWhite;
+   color pClr   = totalProfit >= 0 ? clrLime : clrRed;
+
+   CreateLabel("SGP_h", x, y, "══ ScalpGrid CEZ Pro v3.0 ══", hdrClr, 11);
+   y += 22;
+   CreateLabel("SGP_b", x, y, StringFormat("Balance:     $%.2f", balance), txtClr, fs);
+   y += 16;
+   CreateLabel("SGP_e", x, y, StringFormat("Equity:      $%.2f", equity), txtClr, fs);
+   y += 16;
+   CreateLabel("SGP_m", x, y, StringFormat("Margin:      %.1f%%", marginLevel), txtClr, fs);
+   y += 16;
+   CreateLabel("SGP_s", x, y, StringFormat("Spread:      %d pts", (int)symInfo.Spread()), txtClr, fs);
+   y += 20;
+   CreateLabel("SGP_p", x, y, StringFormat("Positions:   %d (B:%d S:%d)", totalPos, buyPos, sellPos), txtClr, fs);
+   y += 16;
+   CreateLabel("SGP_f", x, y, StringFormat("Float PL:    $%.2f", totalProfit), pClr, fs);
+   y += 20;
+
+   // Grid info
+   string gm = "OFF";
+   if(InpGridMode == GRID_SAME_DIRECTION)      gm = "Averaging";
+   else if(InpGridMode == GRID_MARTINGALE)      gm = "Martingale";
+   else if(InpGridMode == GRID_ANTI_MARTINGALE) gm = "Anti-Mart";
+
+   CreateLabel("SGP_g", x, y, StringFormat("Grid: %s Max:%d", gm, InpGridMaxLevels), hdrClr, fs);
+   y += 18;
+
+   // Signal
+   string ss = "NEUTRAL";
+   color sc  = txtClr;
+   if(g_lastSignal == 1)      { ss = ">> BUY";  sc = clrLime; }
+   else if(g_lastSignal == -1) { ss = "<< SELL"; sc = clrRed; }
+
+   CreateLabel("SGP_i", x, y, StringFormat("Signal:      %s [%d]", ss, g_lastConfluence), sc, fs);
+   y += 18;
+
+   // Volatility regime
+   string vrStr = "NORMAL";
+   color vrClr = txtClr;
+   if(g_volRegime == VOL_LOW)      { vrStr = "LOW";     vrClr = clrDodgerBlue; }
+   else if(g_volRegime == VOL_HIGH)    { vrStr = "HIGH";    vrClr = clrOrange; }
+   else if(g_volRegime == VOL_EXTREME) { vrStr = "EXTREME"; vrClr = clrRed; }
+
+   CreateLabel("SGP_v", x, y, StringFormat("Volatility:  %s", vrStr), vrClr, fs);
+   y += 16;
+
+   // Trend
+   string trStr = "RANGING";
+   color trClr = txtClr;
+   if(g_trendState == TREND_STRONG_UP)   { trStr = "STRONG UP";   trClr = clrLime; }
+   else if(g_trendState == TREND_WEAK_UP)    { trStr = "WEAK UP";     trClr = clrPaleGreen; }
+   else if(g_trendState == TREND_WEAK_DOWN)  { trStr = "WEAK DOWN";   trClr = clrLightCoral; }
+   else if(g_trendState == TREND_STRONG_DOWN) { trStr = "STRONG DOWN"; trClr = clrRed; }
+
+   CreateLabel("SGP_t", x, y, StringFormat("Trend:       %s", trStr), trClr, fs);
+   y += 16;
+
+   // ADX
+   if(InpUseADXFilter)
+     {
+      CreateLabel("SGP_a", x, y, StringFormat("ADX: %.1f DI+:%.1f DI-:%.1f",
+                  g_adxValue, g_adxPlusDI, g_adxMinusDI), txtClr, fs);
+      y += 16;
+     }
+
+   // Structure
+   if(InpUseStructure)
+     {
+      string stStr = "NEUTRAL";
+      if(g_structureDir == 1)       stStr = "BULLISH (HH/HL)";
+      else if(g_structureDir == -1) stStr = "BEARISH (LH/LL)";
+      CreateLabel("SGP_st", x, y, StringFormat("Structure:   %s", stStr), txtClr, fs);
+      y += 16;
+     }
+
+   // Signal details
+   if(StringLen(g_signalDetails) > 0)
+     {
+      string shortDetails = g_signalDetails;
+      if(StringLen(shortDetails) > 50)
+         shortDetails = StringSubstr(shortDetails, 0, 50) + "...";
+      CreateLabel("SGP_d", x, y, StringFormat("Factors: %s", shortDetails), clrDarkGray, 8);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| CLEAN PANEL                                                       |
+//+------------------------------------------------------------------+
+void CleanPanel()
+  {
+   string names[] = {"SGP_h","SGP_b","SGP_e","SGP_m","SGP_s","SGP_p","SGP_f",
+                     "SGP_g","SGP_i","SGP_v","SGP_t","SGP_a","SGP_st","SGP_d"};
+   int count = ArraySize(names);
+   for(int i = 0; i < count; i++)
+     {
+      if(ObjectFind(0, names[i]) >= 0)
+         ObjectDelete(0, names[i]);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| DETECT FILL TYPE                                                  |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING DetectFillType()
+  {
+   long fillMode = 0;
+   SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE, fillMode);
+
+   if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      return ORDER_FILLING_FOK;
+   if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+  }
+
+//+------------------------------------------------------------------+
+//| EXPERT INITIALIZATION                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFilling(DetectFillType());
+
+   symInfo.Name(_Symbol);
+   symInfo.RefreshRates();
+
+   // Core indicators
+   g_hATR    = iATR(_Symbol, _Period, 14);
+   g_hATR_CE = iATR(_Symbol, _Period, InpCEPeriod);
+   g_hRSI    = iRSI(_Symbol, _Period, InpRSIPeriod, PRICE_CLOSE);
+   g_hBB     = iBands(_Symbol, _Period, InpBBPeriod, 0, InpBBDeviation, PRICE_CLOSE);
+
+   // Advanced indicators
+   g_hATR_Vol = iATR(_Symbol, _Period, InpVolATRPeriod);
+   g_hADX     = iADX(_Symbol, _Period, InpADXPeriod);
+
+   // Higher timeframe
+   g_hHTF_RSI = INVALID_HANDLE;
+   g_hHTF_ATR = INVALID_HANDLE;
+   if(InpUseMultiTF)
+     {
+      g_hHTF_RSI = iRSI(_Symbol, InpHTFPeriod, InpRSIPeriod, PRICE_CLOSE);
+      g_hHTF_ATR = iATR(_Symbol, InpHTFPeriod, 14);
+     }
+
+   // Validate handles
+   if(g_hATR == INVALID_HANDLE || g_hATR_CE == INVALID_HANDLE ||
+      g_hRSI == INVALID_HANDLE || g_hBB == INVALID_HANDLE)
+     {
+      Print("[ERROR] Failed to create core indicator handles");
+      return INIT_FAILED;
+     }
+
+   if(g_hATR_Vol == INVALID_HANDLE)
+     {
+      Print("[ERROR] Failed to create ATR_Vol handle");
+      return INIT_FAILED;
+     }
+
+   if(g_hADX == INVALID_HANDLE)
+     {
+      Print("[ERROR] Failed to create ADX handle");
+      return INIT_FAILED;
+     }
+
+   if(InpUseMultiTF && (g_hHTF_RSI == INVALID_HANDLE || g_hHTF_ATR == INVALID_HANDLE))
+     {
+      Print("[WARNING] HTF indicator handles failed - disabling MTF");
+      // Don't fail, just won't use MTF
+     }
+
+   // Init state
+   g_lastBarTime      = 0;
+   g_dailyStartEquity = accInfo.Equity();
+   g_dailyResetTime   = 0;
+   g_initialBalance   = accInfo.Balance();
+   g_initialized      = false;
+   g_lastSignal       = 0;
+   g_lastConfluence   = 0;
+   g_signalDetails    = "";
+   g_confluenceScore  = 0;
+
+   g_ceLongStop       = 0;
+   g_ceShortStop      = 0;
+   g_ceDir            = 0;
+   g_prevCeDir        = 0;
+   g_zlsma1           = 0;
+   g_zlsma2           = 0;
+   g_zlsma3           = 0;
+
+   g_volRegime        = VOL_NORMAL;
+   g_trendState       = TREND_RANGING;
+   g_atrCurrent       = 0;
+   g_atrAverage       = 0;
+   g_adxValue         = 0;
+   g_adxPlusDI        = 0;
+   g_adxMinusDI       = 0;
+   g_volumeRatio      = 0;
+   g_momentumValue    = 0;
+   g_structureDir     = 0;
+   g_haCacheBar       = 0;
+   g_warmupCount      = 0;
+   g_warmupBars       = MathMax(InpCEPeriod, InpZLSMAPeriod) * 2 + InpVolATRPeriod;
+
+   EventSetTimer(InpTimerInterval);
+
+   Print("[INIT] ScalpGrid CEZ Pro v3.0 started");
+   PrintFormat("[INIT] %s | %s | Magic: %d | MinConfluence: %d",
+               _Symbol, EnumToString(_Period), InpMagicNumber, InpMinConfluence);
+   PrintFormat("[INIT] ADX: %s | VolAdapt: %s | Volume: %s | MTF: %s | Structure: %s | Momentum: %s",
+               InpUseADXFilter ? "ON" : "OFF",
+               InpUseVolatilityAdapt ? "ON" : "OFF",
+               InpUseVolumeConfirm ? "ON" : "OFF",
+               InpUseMultiTF ? "ON" : "OFF",
+               InpUseStructure ? "ON" : "OFF",
+               InpUseMomentum ? "ON" : "OFF");
+
+   return INIT_SUCCEEDED;
+  }
+
+//+------------------------------------------------------------------+
+//| EXPERT DEINITIALIZATION                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   CleanPanel();
+
+   if(g_hATR     != INVALID_HANDLE) IndicatorRelease(g_hATR);
+   if(g_hATR_CE  != INVALID_HANDLE) IndicatorRelease(g_hATR_CE);
+   if(g_hATR_Vol != INVALID_HANDLE) IndicatorRelease(g_hATR_Vol);
+   if(g_hRSI     != INVALID_HANDLE) IndicatorRelease(g_hRSI);
+   if(g_hBB      != INVALID_HANDLE) IndicatorRelease(g_hBB);
+   if(g_hADX     != INVALID_HANDLE) IndicatorRelease(g_hADX);
+   if(g_hHTF_RSI != INVALID_HANDLE) IndicatorRelease(g_hHTF_RSI);
+   if(g_hHTF_ATR != INVALID_HANDLE) IndicatorRelease(g_hHTF_ATR);
+
+   Print("[DEINIT] ScalpGrid CEZ Pro v3.0 stopped. Reason: ", reason);
+  }
+
+//+------------------------------------------------------------------+
+//| TIMER                                                             |
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   symInfo.RefreshRates();
+   ManageTrailingStop();
+   CheckEquityDrawdown();
+   CheckDailyLoss();
+   ManageGrid();
+   CheckFridayClose();
+   UpdatePanel();
+  }
+
+//+------------------------------------------------------------------+
+//| ON TICK                                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   int minBars = InpCEPeriod;
+   if(InpZLSMAPeriod > minBars)       minBars = InpZLSMAPeriod;
+   if(InpStructureLookback > minBars) minBars = InpStructureLookback;
+   int needBars = minBars * 3 + 50;
+
+   int totalBars = Bars(_Symbol, _Period);
+   if(totalBars < needBars)
+      return;
+
+   // New bar check
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   if(currentBarTime == g_lastBarTime)
+      return;
+   g_lastBarTime = currentBarTime;
+
+   symInfo.RefreshRates();
+
+   // Warm-up period: let indicators stabilize
+   if(!g_initialized)
+     {
+      g_warmupCount++;
+      // Run CE calculation multiple times to establish state
+      CalcChandelierExit();
+
+      if(g_warmupCount >= 3)
+        {
+         g_initialized = true;
+         Print("[INIT] Warmup complete after ", g_warmupCount, " bars");
+        }
+      return;
+     }
+
+   // Calculate signal with full confluence analysis
+   g_lastSignal = GetSignal();
+
+   // Check conditions
+   if(!InpAllowNewPos)
+      return;
+   if(!IsWithinTradingTime())
+      return;
+
+   // Grid active with positions — let grid handle
+   if(InpGridMode != GRID_DISABLED && CountPositions() > 0)
+      return;
+
+   // No multiple positions
+   if(!InpAllowMultiplePos && CountPositions() > 0)
+      return;
+
+   // Open trade on signal with sufficient confluence
+   if(g_lastSignal != 0)
+     {
+      PrintFormat("[SIGNAL] Direction: %s | Confluence: %d/%d | %s",
+                  g_lastSignal == 1 ? "BUY" : "SELL",
+                  g_confluenceScore, InpMinConfluence,
+                  g_signalDetails);
+      OpenTrade(g_lastSignal);
+     }
+  }
+//+------------------------------------------------------------------+
