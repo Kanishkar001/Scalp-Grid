@@ -1811,7 +1811,7 @@ double CalcGridLots(int level)
       case GRID_MARTINGALE:
         {
          double mMult = mult > 1.0 ? mult : 1.5;
-         // Cap martingale exponent to prevent absurd lot sizes
+         // Cap at level 6 to prevent exponential blowup (1.5^6=11.4x vs 1.5^10=57.7x)
          int    cappedLevel = MathMin(level, 6);
          gridLots = baseLots * MathPow(mMult, (double)cappedLevel);
         }
@@ -1827,7 +1827,9 @@ double CalcGridLots(int level)
          break;
      }
 
-   // Volatility-based grid lot reduction (aggressive at deep levels)
+   // Volatility-based grid lot reduction:
+   // High vol: 80% at level 0, decreasing by 3% per level (floor at 50%)
+   // Extreme vol: 60% at level 0, decreasing by 5% per level (floor at 30%)
    if(InpUseVolatilityAdapt)
      {
       if(g_volRegime == VOL_HIGH)
@@ -2236,20 +2238,21 @@ void ManageGrid()
                basketTP *= 0.8;   // Lower TP in low vol (smaller moves)
            }
 
-         // Factor in average entry distance for better TP scaling
+         // Factor in average entry distance: if positions are far from average,
+         // reduce TP to close sooner (positions are under water)
          double buyAvg  = GetAverageEntryPrice(POSITION_TYPE_BUY);
          double sellAvg = GetAverageEntryPrice(POSITION_TYPE_SELL);
          if(buyAvg > 0 && GetGridLevel(POSITION_TYPE_BUY) > 2)
            {
             double avgDist = MathAbs(symInfo.Ask() - buyAvg) / point;
             if(avgDist > 50)
-               basketTP = MathMax(basketTP, basketTP * 0.5);
+               basketTP *= 0.5;  // Reduce TP when grid is deep underwater
            }
          if(sellAvg > 0 && GetGridLevel(POSITION_TYPE_SELL) > 2)
            {
             double avgDist = MathAbs(sellAvg - symInfo.Bid()) / point;
             if(avgDist > 50)
-               basketTP = MathMax(basketTP, basketTP * 0.5);
+               basketTP *= 0.5;  // Reduce TP when grid is deep underwater
            }
         }
 
@@ -2639,6 +2642,16 @@ ENUM_ORDER_TYPE_FILLING DetectFillType()
 //+------------------------------------------------------------------+
 int OnInit()
   {
+   // Validate input ranges
+   if(InpGridStepScale < 0.0 || InpGridStepScale > 1.0)
+     {
+      PrintFormat("[WARNING] InpGridStepScale %.2f out of range (0.0-1.0), clamping to 0.15", InpGridStepScale);
+     }
+   if(InpConsecCandleMin < 2 || InpConsecCandleMin > 5)
+     {
+      PrintFormat("[WARNING] InpConsecCandleMin %d out of range (2-5)", InpConsecCandleMin);
+     }
+
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpSlippage);
    trade.SetTypeFilling(DetectFillType());
@@ -2811,13 +2824,14 @@ void OnTick()
    symInfo.RefreshRates();
 
    // Warm-up period: let indicators stabilize proportionally
+   // Uses max(CE, ZLSMA) period / 4 to give recursive CE enough history to converge
    if(!g_initialized)
      {
       g_warmupCount++;
       // Run CE calculation multiple times to establish state
       CalcChandelierExit();
 
-      // Proportional warmup: use the larger of CE period or ZLSMA period
+      // Proportional warmup: minimum 5 bars, scaled to indicator complexity
       int requiredWarmup = MathMax(5, MathMax(InpCEPeriod, InpZLSMAPeriod) / 4);
       if(g_warmupCount >= requiredWarmup)
         {
