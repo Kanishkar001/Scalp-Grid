@@ -1249,7 +1249,8 @@ int GetSignal()
         {
          // In ranging markets, only reduce the side with less conviction
          // instead of penalizing both sides which makes confluence unreachable
-         if(buyScore >= sellScore && sellScore > 0)
+         // If scores are equal, skip penalty (neither side is weaker)
+         if(buyScore > sellScore && sellScore > 0)
             sellScore -= 1;
          else if(sellScore > buyScore && buyScore > 0)
             buyScore -= 1;
@@ -1277,7 +1278,8 @@ int GetSignal()
         {
          // Low volume - reduce confidence on weaker side only
          // Avoids double-penalty with VOL_LOW regime adjustment
-         if(buyScore >= sellScore && sellScore > 0)
+         // If scores are equal, skip penalty (neither side is weaker)
+         if(buyScore > sellScore && sellScore > 0)
             sellScore -= 1;
          else if(sellScore > buyScore && buyScore > 0)
             buyScore -= 1;
@@ -1440,7 +1442,8 @@ int GetSignal()
    else if(g_volRegime == VOL_LOW)
      {
       // Low volatility - penalize weaker side only (less harsh than extreme)
-      if(buyScore >= sellScore && sellScore > 0)
+      // If scores are equal, skip penalty (neither side is weaker)
+      if(buyScore > sellScore && sellScore > 0)
          sellScore -= 1;
       else if(sellScore > buyScore && buyScore > 0)
          buyScore -= 1;
