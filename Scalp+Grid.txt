@@ -1528,7 +1528,16 @@ double CalcLotSize(double slPoints)
    if(lotSize < minLot) lotSize = minLot;
    if(lotSize > maxLot) lotSize = maxLot;
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
-   lotSize = NormalizeDouble(lotSize, 2);
+
+   // Determine decimal precision from lotStep (e.g. 0.01→2, 0.001→3)
+   int lotPrecision = 2;
+   if(lotStep >= 1.0)        lotPrecision = 0;
+   else if(lotStep >= 0.1)   lotPrecision = 1;
+   else if(lotStep >= 0.01)  lotPrecision = 2;
+   else if(lotStep >= 0.001) lotPrecision = 3;
+   else                      lotPrecision = 4;
+
+   lotSize = NormalizeDouble(lotSize, lotPrecision);
    if(lotSize < minLot) lotSize = minLot;
 
    return lotSize;
@@ -1882,6 +1891,20 @@ bool OpenTrade(int signal)
    double tp     = CalcTakeProfit(isBuy, price, sl);
    double lots   = CalcLotSize(slDist);
 
+   // Free margin check: avoid silent rejection on small accounts (e.g. $100)
+   double marginRequired = 0;
+   ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   if(OrderCalcMargin(orderType, _Symbol, lots, price, marginRequired))
+     {
+      if(accInfo.FreeMargin() < marginRequired)
+        {
+         PrintFormat("[WARN] Insufficient free margin: need=%.2f, free=%.2f, lots=%.3f. "
+                     "Balance=%.2f - consider reducing InpRiskValue or using a larger account.",
+                     marginRequired, accInfo.FreeMargin(), lots, accInfo.Balance());
+         return false;
+        }
+     }
+
    price = NormalizeDouble(price, digits);
    sl    = NormalizeDouble(sl, digits);
    if(tp > 0) tp = NormalizeDouble(tp, digits);
@@ -1895,10 +1918,11 @@ bool OpenTrade(int signal)
       result = trade.Sell(lots, _Symbol, price, sl, tp, comment);
 
    if(result)
-      PrintFormat("[TRADE] %s | Price: %.5f | SL: %.5f | TP: %.5f | Lots: %.2f | Confluence: %d | %s",
+      PrintFormat("[TRADE] %s | Price: %.5f | SL: %.5f | TP: %.5f | Lots: %.3f | Confluence: %d | %s",
                   isBuy ? "BUY" : "SELL", price, sl, tp, lots, g_confluenceScore, g_signalDetails);
    else
-      PrintFormat("[ERROR] Trade failed: %d - %s", GetLastError(), trade.ResultComment());
+      PrintFormat("[ERROR] Trade failed: %d - %s | Lots: %.3f | Balance: %.2f | FreeMargin: %.2f",
+                  GetLastError(), trade.ResultComment(), lots, accInfo.Balance(), accInfo.FreeMargin());
 
    return result;
   }
@@ -2135,13 +2159,24 @@ void ManageGrid()
                sl           = NormalizeDouble(sl, digits);
                if(tp > 0) tp = NormalizeDouble(tp, digits);
 
-               string comment = StringFormat("%s_G%d", InpEAComment, buyCount + 1);
-               if(trade.Buy(gridLots, _Symbol, currentPrice, sl, tp, comment))
+               // Free margin check for grid buy entry
+               double marginNeededBuy = 0;
+               if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, gridLots, currentPrice, marginNeededBuy) &&
+                  accInfo.FreeMargin() < marginNeededBuy)
                  {
-                  g_gridLastBuyTime = currentBarTime;
-                  PrintFormat("[GRID] BUY Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f | Step: %.1f",
-                              buyCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_BUY),
-                              effectiveStep / point);
+                  PrintFormat("[WARN] Grid BUY Lvl %d skipped: need=%.2f, free=%.2f",
+                              buyCount + 1, marginNeededBuy, accInfo.FreeMargin());
+                 }
+               else
+                 {
+                  string comment = StringFormat("%s_G%d", InpEAComment, buyCount + 1);
+                  if(trade.Buy(gridLots, _Symbol, currentPrice, sl, tp, comment))
+                    {
+                     g_gridLastBuyTime = currentBarTime;
+                     PrintFormat("[GRID] BUY Lvl %d | Price: %.5f | Lots: %.3f | AvgEntry: %.5f | Step: %.1f",
+                                 buyCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_BUY),
+                                 effectiveStep / point);
+                    }
                  }
               }
            }
@@ -2198,13 +2233,24 @@ void ManageGrid()
                sl           = NormalizeDouble(sl, digits);
                if(tp > 0) tp = NormalizeDouble(tp, digits);
 
-               string comment = StringFormat("%s_G%d", InpEAComment, sellCount + 1);
-               if(trade.Sell(gridLots, _Symbol, currentPrice, sl, tp, comment))
+               // Free margin check for grid sell entry
+               double marginNeededSell = 0;
+               if(OrderCalcMargin(ORDER_TYPE_SELL, _Symbol, gridLots, currentPrice, marginNeededSell) &&
+                  accInfo.FreeMargin() < marginNeededSell)
                  {
-                  g_gridLastSellTime = currentBarTime;
-                  PrintFormat("[GRID] SELL Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f | Step: %.1f",
-                              sellCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_SELL),
-                              effectiveStep / point);
+                  PrintFormat("[WARN] Grid SELL Lvl %d skipped: need=%.2f, free=%.2f",
+                              sellCount + 1, marginNeededSell, accInfo.FreeMargin());
+                 }
+               else
+                 {
+                  string comment = StringFormat("%s_G%d", InpEAComment, sellCount + 1);
+                  if(trade.Sell(gridLots, _Symbol, currentPrice, sl, tp, comment))
+                    {
+                     g_gridLastSellTime = currentBarTime;
+                     PrintFormat("[GRID] SELL Lvl %d | Price: %.5f | Lots: %.3f | AvgEntry: %.5f | Step: %.1f",
+                                 sellCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_SELL),
+                                 effectiveStep / point);
+                    }
                  }
               }
            }
