@@ -3,9 +3,9 @@
 //|          Advanced Scalping + Grid EA - Complete Market Analysis  |
 //|          Rebuilt with proper CE, ZLSMA, multi-factor confluence  |
 //+------------------------------------------------------------------+
-#property copyright "ScalpGrid Pro v4.0 - Production Grade"
+#property copyright "ScalpGrid Pro v4.1 - Production Grade"
 #property link      "https://github.com/geraked/metatrader5"
-#property version   "4.00"
+#property version   "4.10"
 #property description "Advanced Scalping + Grid EA using Chandelier Exit, ZLSMA,"
 #property description "RSI Divergence, BB, ADX, Volume, Momentum on Heikin Ashi"
 #property description "with trend-aware intelligent grid recovery and confluence scoring"
@@ -72,7 +72,7 @@ input int         InpBBPeriod          = 20;
 input double      InpBBDeviation       = 2.0;
 input bool        InpUseHeikinAshi     = true;
 input bool        InpUseRSIFilter      = true;
-input bool        InpUseBBFilter       = false;
+input bool        InpUseBBFilter       = true;       // Enable BB for extra confluence scoring
 
 input group "═══════════ ADVANCED ANALYSIS ═══════════"
 input bool        InpUseADXFilter      = true;      // Use ADX Trend Strength Filter
@@ -139,7 +139,7 @@ input group "═══════════ POSITION LIMITS ═════�
 input bool        InpAllowNewPos       = true;
 input bool        InpAllowMultiplePos  = false;
 input double      InpMarginLevelLimit  = 300;
-input int         InpSpreadLimit       = 30;
+input int         InpSpreadLimit       = 50;         // Max spread in broker points (5-digit: 50pts = 5 pips)
 input int         InpMaxPositions      = 15;
 
 input group "═══════════ TIME FILTER ═══════════"
@@ -171,10 +171,8 @@ int            g_hATR_Vol;     // For volatility regime
 int            g_hRSI;
 int            g_hBB;
 int            g_hADX;
-int            g_hVolume;      // Tick volume or real volume
 int            g_hHTF_RSI;     // Higher timeframe RSI
 int            g_hHTF_ATR;     // Higher timeframe ATR
-int            g_hMomentum;    // Momentum indicator (ROC)
 
 // Chandelier Exit state - proper recursive tracking
 struct CEState
@@ -1246,11 +1244,15 @@ int GetSignal()
       if(g_trendState == TREND_STRONG_DOWN)
          buyScore -= 1;
 
-      // PENALTY: No trend (ranging) - reduce confidence
+      // PENALTY: No trend (ranging) - penalize only the weaker side
       if(g_trendState == TREND_RANGING)
         {
-         buyScore  -= 1;
-         sellScore -= 1;
+         // In ranging markets, only reduce the side with less conviction
+         // instead of penalizing both sides which makes confluence unreachable
+         if(buyScore >= sellScore && sellScore > 0)
+            sellScore -= 1;
+         else if(sellScore > buyScore && buyScore > 0)
+            buyScore -= 1;
          g_signalDetails += "RANGE! ";
         }
      }
@@ -1273,9 +1275,12 @@ int GetSignal()
         }
       else if(volRatio < 0.7)
         {
-         // Low volume - reduce confidence
-         buyScore  -= 1;
-         sellScore -= 1;
+         // Low volume - reduce confidence on weaker side only
+         // Avoids double-penalty with VOL_LOW regime adjustment
+         if(buyScore >= sellScore && sellScore > 0)
+            sellScore -= 1;
+         else if(sellScore > buyScore && buyScore > 0)
+            buyScore -= 1;
          g_signalDetails += "LOWVOL! ";
         }
      }
@@ -1434,9 +1439,11 @@ int GetSignal()
      }
    else if(g_volRegime == VOL_LOW)
      {
-      // Low volatility - less reliable signals
-      buyScore  -= 1;
-      sellScore -= 1;
+      // Low volatility - penalize weaker side only (less harsh than extreme)
+      if(buyScore >= sellScore && sellScore > 0)
+         sellScore -= 1;
+      else if(sellScore > buyScore && buyScore > 0)
+         buyScore -= 1;
       g_signalDetails += "LOWVOL_R! ";
      }
 
@@ -1460,8 +1467,17 @@ int GetSignal()
    if(buyScore >= InpMinConfluence && sellScore >= InpMinConfluence)
      {
       if(MathAbs(buyScore - sellScore) < 2)
+        {
+         PrintFormat("[INFO] Conflicting signals cancelled: Buy=%d Sell=%d (diff < 2) | %s",
+                     buyScore, sellScore, g_signalDetails);
          signal = 0;  // Too close - no trade
+        }
      }
+
+   // Log when score exists but below minimum (helps diagnose no-trade issues)
+   if(signal == 0 && (buyScore > 0 || sellScore > 0))
+      PrintFormat("[INFO] Score below minimum: Buy=%d Sell=%d Min=%d | %s",
+                  buyScore, sellScore, InpMinConfluence, g_signalDetails);
 
    //--- Reverse if enabled
    if(InpReverseSignal && signal != 0)
@@ -1869,13 +1885,21 @@ bool OpenTrade(int signal)
    symInfo.RefreshRates();
 
    if(InpSpreadLimit >= 0 && (int)symInfo.Spread() > InpSpreadLimit)
+     {
+      PrintFormat("[BLOCK] Spread too high: %d > %d pts — trade skipped",
+                  (int)symInfo.Spread(), InpSpreadLimit);
       return false;
+     }
 
    if(InpMarginLevelLimit > 0 && PositionsTotal() > 0)
      {
       double ml = accInfo.MarginLevel();
       if(ml > 0 && ml < InpMarginLevelLimit)
+        {
+         PrintFormat("[BLOCK] Margin level too low: %.1f%% < %.1f%% — trade skipped",
+                     ml, InpMarginLevelLimit);
          return false;
+        }
      }
 
    bool   isBuy  = (signal == 1);
@@ -2550,7 +2574,7 @@ void UpdatePanel()
    color txtClr = clrWhite;
    color pClr   = totalProfit >= 0 ? clrLime : clrRed;
 
-   CreateLabel("SGP_h", x, y, "══ ScalpGrid CEZ Pro v4.0 ══", hdrClr, 11);
+   CreateLabel("SGP_h", x, y, "══ ScalpGrid CEZ Pro v4.1 ══", hdrClr, 11);
    y += 22;
    CreateLabel("SGP_b", x, y, StringFormat("Balance:     $%.2f", balance), txtClr, fs);
    y += 16;
@@ -2793,7 +2817,7 @@ int OnInit()
 
    EventSetTimer(InpTimerInterval);
 
-   Print("[INIT] ScalpGrid CEZ Pro v4.0 started");
+   Print("[INIT] ScalpGrid CEZ Pro v4.1 started");
    PrintFormat("[INIT] %s | %s | Magic: %d | MinConfluence: %d",
                _Symbol, EnumToString(_Period), InpMagicNumber, InpMinConfluence);
    PrintFormat("[INIT] ADX: %s | VolAdapt: %s | Volume: %s | MTF: %s | Structure: %s | Momentum: %s",
@@ -2830,7 +2854,7 @@ void OnDeinit(const int reason)
    if(g_hHTF_RSI != INVALID_HANDLE) IndicatorRelease(g_hHTF_RSI);
    if(g_hHTF_ATR != INVALID_HANDLE) IndicatorRelease(g_hHTF_ATR);
 
-   Print("[DEINIT] ScalpGrid CEZ Pro v4.0 stopped. Reason: ", reason);
+   Print("[DEINIT] ScalpGrid CEZ Pro v4.1 stopped. Reason: ", reason);
   }
 
 //+------------------------------------------------------------------+
@@ -2892,17 +2916,35 @@ void OnTick()
 
    // Check conditions
    if(!InpAllowNewPos)
+     {
+      if(g_lastSignal != 0)
+         Print("[BLOCK] InpAllowNewPos is false — new trades disabled");
       return;
+     }
    if(!IsWithinTradingTime())
+     {
+      if(g_lastSignal != 0)
+         Print("[BLOCK] Outside trading hours — trade skipped");
       return;
+     }
 
    // Grid active with positions — let grid handle
    if(InpGridMode != GRID_DISABLED && CountPositions() > 0)
+     {
+      if(g_lastSignal != 0)
+         PrintFormat("[BLOCK] Grid active with %d positions — ManageGrid() handles entries",
+                     CountPositions());
       return;
+     }
 
    // No multiple positions
    if(!InpAllowMultiplePos && CountPositions() > 0)
+     {
+      if(g_lastSignal != 0)
+         PrintFormat("[BLOCK] Already have %d position(s) and AllowMultiplePos=false",
+                     CountPositions());
       return;
+     }
 
    // Open trade on signal with sufficient confluence
    if(g_lastSignal != 0)
