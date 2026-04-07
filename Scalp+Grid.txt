@@ -1811,7 +1811,9 @@ double CalcGridLots(int level)
       case GRID_MARTINGALE:
         {
          double mMult = mult > 1.0 ? mult : 1.5;
-         gridLots = baseLots * MathPow(mMult, (double)level);
+         // Cap martingale exponent to prevent absurd lot sizes
+         int    cappedLevel = MathMin(level, 6);
+         gridLots = baseLots * MathPow(mMult, (double)cappedLevel);
         }
       break;
       case GRID_ANTI_MARTINGALE:
@@ -1823,6 +1825,15 @@ double CalcGridLots(int level)
       default:
          gridLots = baseLots;
          break;
+     }
+
+   // Volatility-based grid lot reduction (aggressive at deep levels)
+   if(InpUseVolatilityAdapt)
+     {
+      if(g_volRegime == VOL_HIGH)
+         gridLots *= MathMax(0.5, 0.8 - level * 0.03);
+      else if(g_volRegime == VOL_EXTREME)
+         gridLots *= MathMax(0.3, 0.6 - level * 0.05);
      }
 
    if(gridLots < minLot) gridLots = minLot;
@@ -1891,32 +1902,86 @@ bool OpenTrade(int signal)
   }
 
 //+------------------------------------------------------------------+
-//| SMART GRID: Check if price is at a value zone for grid entry      |
+//| SMART GRID: Multi-factor value zone check for grid entry          |
 //+------------------------------------------------------------------+
 bool IsGridValueZone(bool isBuy)
   {
    if(!InpGridSmartEntry)
       return true;  // Always allow if smart entry disabled
 
-   // Check if price has pulled back to a meaningful level
-   double rsi[];
-   if(!SafeCopyBuffer(g_hRSI, 0, 1, 2, rsi) || ArraySize(rsi) < 2)
-      return true;
+   int valueScore = 0;  // Need >= 2 to pass
 
-   if(isBuy)
+   // Factor 1: RSI check - price has pulled back
+   double rsi[];
+   if(SafeCopyBuffer(g_hRSI, 0, 1, 2, rsi) && ArraySize(rsi) >= 2)
      {
-      // For buy grid: add when RSI shows oversold or neutral (not overbought)
-      return (rsi[0] < 60);
+      if(isBuy)
+        {
+         if(rsi[0] < 45) valueScore += 2;       // Oversold = great value
+         else if(rsi[0] < 55) valueScore += 1;   // Neutral = ok
+         else if(rsi[0] > 70) return false;       // Overbought = never add buy grid
+        }
+      else
+        {
+         if(rsi[0] > 55) valueScore += 2;       // Overbought = great value
+         else if(rsi[0] > 45) valueScore += 1;   // Neutral = ok
+         else if(rsi[0] < 30) return false;       // Oversold = never add sell grid
+        }
      }
    else
+      valueScore += 1;  // No data = assume ok
+
+   // Factor 2: Bollinger Band proximity - price near value band
+   double bbUpper[], bbLower[], bbMiddle[];
+   if(SafeCopyBuffer(g_hBB, 1, 1, 1, bbUpper) && ArraySize(bbUpper) >= 1 &&
+      SafeCopyBuffer(g_hBB, 2, 1, 1, bbLower) && ArraySize(bbLower) >= 1 &&
+      SafeCopyBuffer(g_hBB, 0, 1, 1, bbMiddle) && ArraySize(bbMiddle) >= 1)
      {
-      // For sell grid: add when RSI shows overbought or neutral (not oversold)
-      return (rsi[0] > 40);
+      symInfo.RefreshRates();
+      double price = isBuy ? symInfo.Ask() : symInfo.Bid();
+
+      if(isBuy)
+        {
+         // Buy grid value: price near or below lower BB or below middle
+         if(price <= bbLower[0]) valueScore += 2;
+         else if(price <= bbMiddle[0]) valueScore += 1;
+        }
+      else
+        {
+         // Sell grid value: price near or above upper BB or above middle
+         if(price >= bbUpper[0]) valueScore += 2;
+         else if(price >= bbMiddle[0]) valueScore += 1;
+        }
      }
+
+   // Factor 3: ZLSMA distance - price near or beyond ZLSMA
+   if(g_zlsma1 > 0)
+     {
+      symInfo.RefreshRates();
+      double price = isBuy ? symInfo.Ask() : symInfo.Bid();
+      double atrBuf[];
+
+      if(SafeCopyBuffer(g_hATR, 0, 1, 1, atrBuf) && ArraySize(atrBuf) >= 1 && atrBuf[0] > 0)
+        {
+         double distFromZLSMA = (price - g_zlsma1) / atrBuf[0];
+         if(isBuy)
+           {
+            // Buy grid: price below ZLSMA is value
+            if(distFromZLSMA < -0.5) valueScore += 1;
+           }
+         else
+           {
+            // Sell grid: price above ZLSMA is value
+            if(distFromZLSMA > 0.5) valueScore += 1;
+           }
+        }
+     }
+
+   return (valueScore >= 2);
   }
 
 //+------------------------------------------------------------------+
-//| GRID MANAGEMENT                                                   |
+//| GRID MANAGEMENT - Trend-Aware with Dynamic Steps                  |
 //+------------------------------------------------------------------+
 void ManageGrid()
   {
@@ -1930,6 +1995,60 @@ void ManageGrid()
    if(point <= 0) return;
 
    int digits = (int)symInfo.Digits();
+
+   // Track peak equity for grid DD limit
+   double equity = accInfo.Equity();
+   if(equity > g_gridPeakEquity)
+      g_gridPeakEquity = equity;
+
+   //--- Grid DD limit check: close all if grid drawdown exceeds limit
+   if(InpGridDDLimit > 0 && CountPositions() > 1)
+     {
+      double totalProfit = GetTotalProfit();
+      if(totalProfit < 0 && MathAbs(totalProfit) >= InpGridDDLimit)
+        {
+         CloseAllPositions();
+         PrintFormat("[GRID_DD] Grid DD limit hit: $%.2f loss >= $%.2f limit", MathAbs(totalProfit), InpGridDDLimit);
+         return;
+        }
+     }
+
+   //--- Grid partial close: close individually profitable positions
+   if(InpGridPartialClose && CountPositions() > 1)
+     {
+      double partialTP = InpGridPartialTP;
+      if(partialTP <= 0)
+        {
+         // Auto: use ATR * 0.5 as partial TP
+         double atrP[];
+         if(SafeCopyBuffer(g_hATR, 0, 1, 1, atrP) && ArraySize(atrP) >= 1 && atrP[0] > 0)
+            partialTP = atrP[0] / point * 0.5;
+         else
+            partialTP = 100;
+        }
+
+      int total = PositionsTotal();
+      for(int i = total - 1; i >= 0; i--)
+        {
+         if(!posInfo.SelectByIndex(i)) continue;
+         if(posInfo.Magic() != InpMagicNumber || posInfo.Symbol() != _Symbol) continue;
+
+         double openP  = posInfo.PriceOpen();
+         double profPts = 0;
+
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            profPts = (symInfo.Bid() - openP) / point;
+         else if(posInfo.PositionType() == POSITION_TYPE_SELL)
+            profPts = (openP - symInfo.Ask()) / point;
+
+         if(profPts >= partialTP)
+           {
+            ulong ticket = posInfo.Ticket();
+            if(trade.PositionClose(ticket, InpSlippage))
+               PrintFormat("[GRID_PARTIAL] Closed ticket %d at +%.0f pts", ticket, profPts);
+           }
+        }
+     }
 
    // Grid step calculation
    double gridStep = 0;
@@ -1960,32 +2079,69 @@ void ManageGrid()
 
    if(gridStep <= 0) return;
 
+   //--- Cooldown check helper: minimum bars between grid additions
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+
    // BUY GRID
    int buyCount = GetGridLevel(POSITION_TYPE_BUY);
    if(buyCount > 0 && buyCount < InpGridMaxLevels && CountPositions() < InpMaxPositions)
      {
-      double lastPrice    = GetLastEntryPrice(POSITION_TYPE_BUY);
-      double currentPrice = symInfo.Ask();
-
-      if(lastPrice > 0 && currentPrice > 0 && (lastPrice - currentPrice) >= gridStep)
+      // Trend awareness: don't add buy grid if trend is strongly against us
+      bool trendBlocked = false;
+      if(InpGridTrendAware)
         {
-         if(IsGridValueZone(true))
+         if(g_trendState == TREND_STRONG_DOWN)
            {
-            double gridLots = CalcGridLots(buyCount);
-            double sl       = CalcStopLoss(true);
-            double tp       = 0;
+            trendBlocked = true;
+            // Exception: allow if grid is very deep (level >= 5) and structure is turning
+            if(buyCount >= 5 && g_structureDir >= 0)
+               trendBlocked = false;
+           }
+        }
 
-            if(InpGridTPPoints > 0)
-               tp = currentPrice + InpGridTPPoints * point;
+      // Cooldown: check if enough bars have passed since last grid entry
+      bool cooldownOk = true;
+      if(InpGridCooldownBars > 0 && g_gridLastBuyTime > 0)
+        {
+         int barsSinceLastGrid = iBarShift(_Symbol, _Period, g_gridLastBuyTime);
+         if(barsSinceLastGrid < InpGridCooldownBars)
+            cooldownOk = false;
+        }
 
-            currentPrice = NormalizeDouble(currentPrice, digits);
-            sl           = NormalizeDouble(sl, digits);
-            if(tp > 0) tp = NormalizeDouble(tp, digits);
+      if(!trendBlocked && cooldownOk)
+        {
+         double lastPrice    = GetLastEntryPrice(POSITION_TYPE_BUY);
+         double currentPrice = symInfo.Ask();
 
-            string comment = StringFormat("%s_G%d", InpEAComment, buyCount + 1);
-            if(trade.Buy(gridLots, _Symbol, currentPrice, sl, tp, comment))
-               PrintFormat("[GRID] BUY Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f",
-                           buyCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_BUY));
+         // Dynamic step widening: deeper levels get wider steps
+         double effectiveStep = gridStep;
+         if(InpGridDynamicStep && buyCount > 1)
+            effectiveStep = gridStep * (1.0 + (buyCount - 1) * InpGridStepScale);
+
+         if(lastPrice > 0 && currentPrice > 0 && (lastPrice - currentPrice) >= effectiveStep)
+           {
+            if(IsGridValueZone(true))
+              {
+               double gridLots = CalcGridLots(buyCount);
+               double sl       = CalcStopLoss(true);
+               double tp       = 0;
+
+               if(InpGridTPPoints > 0)
+                  tp = currentPrice + InpGridTPPoints * point;
+
+               currentPrice = NormalizeDouble(currentPrice, digits);
+               sl           = NormalizeDouble(sl, digits);
+               if(tp > 0) tp = NormalizeDouble(tp, digits);
+
+               string comment = StringFormat("%s_G%d", InpEAComment, buyCount + 1);
+               if(trade.Buy(gridLots, _Symbol, currentPrice, sl, tp, comment))
+                 {
+                  g_gridLastBuyTime = currentBarTime;
+                  PrintFormat("[GRID] BUY Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f | Step: %.1f",
+                              buyCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_BUY),
+                              effectiveStep / point);
+                 }
+              }
            }
         }
      }
@@ -1994,33 +2150,66 @@ void ManageGrid()
    int sellCount = GetGridLevel(POSITION_TYPE_SELL);
    if(sellCount > 0 && sellCount < InpGridMaxLevels && CountPositions() < InpMaxPositions)
      {
-      double lastPrice    = GetLastEntryPrice(POSITION_TYPE_SELL);
-      double currentPrice = symInfo.Bid();
-
-      if(lastPrice > 0 && currentPrice > 0 && (currentPrice - lastPrice) >= gridStep)
+      // Trend awareness: don't add sell grid if trend is strongly against us
+      bool trendBlocked = false;
+      if(InpGridTrendAware)
         {
-         if(IsGridValueZone(false))
+         if(g_trendState == TREND_STRONG_UP)
            {
-            double gridLots = CalcGridLots(sellCount);
-            double sl       = CalcStopLoss(false);
-            double tp       = 0;
+            trendBlocked = true;
+            if(sellCount >= 5 && g_structureDir <= 0)
+               trendBlocked = false;
+           }
+        }
 
-            if(InpGridTPPoints > 0)
-               tp = currentPrice - InpGridTPPoints * point;
+      // Cooldown check
+      bool cooldownOk = true;
+      if(InpGridCooldownBars > 0 && g_gridLastSellTime > 0)
+        {
+         int barsSinceLastGrid = iBarShift(_Symbol, _Period, g_gridLastSellTime);
+         if(barsSinceLastGrid < InpGridCooldownBars)
+            cooldownOk = false;
+        }
 
-            currentPrice = NormalizeDouble(currentPrice, digits);
-            sl           = NormalizeDouble(sl, digits);
-            if(tp > 0) tp = NormalizeDouble(tp, digits);
+      if(!trendBlocked && cooldownOk)
+        {
+         double lastPrice    = GetLastEntryPrice(POSITION_TYPE_SELL);
+         double currentPrice = symInfo.Bid();
 
-            string comment = StringFormat("%s_G%d", InpEAComment, sellCount + 1);
-            if(trade.Sell(gridLots, _Symbol, currentPrice, sl, tp, comment))
-               PrintFormat("[GRID] SELL Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f",
-                           sellCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_SELL));
+         // Dynamic step widening
+         double effectiveStep = gridStep;
+         if(InpGridDynamicStep && sellCount > 1)
+            effectiveStep = gridStep * (1.0 + (sellCount - 1) * InpGridStepScale);
+
+         if(lastPrice > 0 && currentPrice > 0 && (currentPrice - lastPrice) >= effectiveStep)
+           {
+            if(IsGridValueZone(false))
+              {
+               double gridLots = CalcGridLots(sellCount);
+               double sl       = CalcStopLoss(false);
+               double tp       = 0;
+
+               if(InpGridTPPoints > 0)
+                  tp = currentPrice - InpGridTPPoints * point;
+
+               currentPrice = NormalizeDouble(currentPrice, digits);
+               sl           = NormalizeDouble(sl, digits);
+               if(tp > 0) tp = NormalizeDouble(tp, digits);
+
+               string comment = StringFormat("%s_G%d", InpEAComment, sellCount + 1);
+               if(trade.Sell(gridLots, _Symbol, currentPrice, sl, tp, comment))
+                 {
+                  g_gridLastSellTime = currentBarTime;
+                  PrintFormat("[GRID] SELL Lvl %d | Price: %.5f | Lots: %.2f | AvgEntry: %.5f | Step: %.1f",
+                              sellCount + 1, currentPrice, gridLots, GetAverageEntryPrice(POSITION_TYPE_SELL),
+                              effectiveStep / point);
+                 }
+              }
            }
         }
      }
 
-   // BASKET CLOSE
+   // BASKET CLOSE - Adaptive to volatility and average entry distance
    if(InpGridBasketClose && CountPositions() > 0)
      {
       double totalProfit = GetTotalProfit();
@@ -2035,6 +2224,33 @@ void ManageGrid()
          int totalGridLevels = GetGridLevel(POSITION_TYPE_BUY) + GetGridLevel(POSITION_TYPE_SELL);
          if(totalGridLevels > 3)
             basketTP *= (1.0 + (totalGridLevels - 3) * 0.1);
+
+         // Volatility-adaptive basket TP
+         if(InpUseVolatilityAdapt)
+           {
+            if(g_volRegime == VOL_HIGH)
+               basketTP *= 1.3;   // Higher TP in high vol (bigger moves possible)
+            else if(g_volRegime == VOL_EXTREME)
+               basketTP *= 0.7;   // Lower TP in extreme vol (take what you can)
+            else if(g_volRegime == VOL_LOW)
+               basketTP *= 0.8;   // Lower TP in low vol (smaller moves)
+           }
+
+         // Factor in average entry distance for better TP scaling
+         double buyAvg  = GetAverageEntryPrice(POSITION_TYPE_BUY);
+         double sellAvg = GetAverageEntryPrice(POSITION_TYPE_SELL);
+         if(buyAvg > 0 && GetGridLevel(POSITION_TYPE_BUY) > 2)
+           {
+            double avgDist = MathAbs(symInfo.Ask() - buyAvg) / point;
+            if(avgDist > 50)
+               basketTP = MathMax(basketTP, basketTP * 0.5);
+           }
+         if(sellAvg > 0 && GetGridLevel(POSITION_TYPE_SELL) > 2)
+           {
+            double avgDist = MathAbs(sellAvg - symInfo.Bid()) / point;
+            if(avgDist > 50)
+               basketTP = MathMax(basketTP, basketTP * 0.5);
+           }
         }
 
       if(totalProfit >= basketTP)
@@ -2285,7 +2501,7 @@ void UpdatePanel()
    color txtClr = clrWhite;
    color pClr   = totalProfit >= 0 ? clrLime : clrRed;
 
-   CreateLabel("SGP_h", x, y, "══ ScalpGrid CEZ Pro v3.0 ══", hdrClr, 11);
+   CreateLabel("SGP_h", x, y, "══ ScalpGrid CEZ Pro v4.0 ══", hdrClr, 11);
    y += 22;
    CreateLabel("SGP_b", x, y, StringFormat("Balance:     $%.2f", balance), txtClr, fs);
    y += 16;
@@ -2357,6 +2573,27 @@ void UpdatePanel()
       y += 16;
      }
 
+   // RSI Divergence
+   if(InpUseRSIDivergence)
+     {
+      string divStr = "None";
+      color  divClr = txtClr;
+      if(g_rsiDivSignal == 1)       { divStr = "BULLISH"; divClr = clrLime; }
+      else if(g_rsiDivSignal == -1) { divStr = "BEARISH"; divClr = clrRed; }
+      CreateLabel("SGP_div", x, y, StringFormat("RSI Diverg:  %s", divStr), divClr, fs);
+      y += 16;
+     }
+
+   // Grid level details
+   if(InpGridMode != GRID_DISABLED)
+     {
+      int buyLvl  = GetGridLevel(POSITION_TYPE_BUY);
+      int sellLvl = GetGridLevel(POSITION_TYPE_SELL);
+      string gridInfo = StringFormat("Grid Lvls:   B:%d S:%d / %d", buyLvl, sellLvl, InpGridMaxLevels);
+      CreateLabel("SGP_gl", x, y, gridInfo, clrYellow, fs);
+      y += 16;
+     }
+
    // Signal details
    if(StringLen(g_signalDetails) > 0)
      {
@@ -2373,7 +2610,7 @@ void UpdatePanel()
 void CleanPanel()
   {
    string names[] = {"SGP_h","SGP_b","SGP_e","SGP_m","SGP_s","SGP_p","SGP_f",
-                     "SGP_g","SGP_i","SGP_v","SGP_t","SGP_a","SGP_st","SGP_d"};
+                     "SGP_g","SGP_i","SGP_v","SGP_t","SGP_a","SGP_st","SGP_div","SGP_gl","SGP_d"};
    int count = ArraySize(names);
    for(int i = 0; i < count; i++)
      {
@@ -2487,9 +2724,17 @@ int OnInit()
    g_warmupCount      = 0;
    g_warmupBars       = MathMax(InpCEPeriod, InpZLSMAPeriod) * 2 + InpVolATRPeriod;
 
+   // New v4.0 globals
+   g_gridLastBuyTime  = 0;
+   g_gridLastSellTime = 0;
+   g_gridPeakEquity   = accInfo.Equity();
+   g_rsiDivSignal     = 0;
+   g_consecBullCount  = 0;
+   g_consecBearCount  = 0;
+
    EventSetTimer(InpTimerInterval);
 
-   Print("[INIT] ScalpGrid CEZ Pro v3.0 started");
+   Print("[INIT] ScalpGrid CEZ Pro v4.0 started");
    PrintFormat("[INIT] %s | %s | Magic: %d | MinConfluence: %d",
                _Symbol, EnumToString(_Period), InpMagicNumber, InpMinConfluence);
    PrintFormat("[INIT] ADX: %s | VolAdapt: %s | Volume: %s | MTF: %s | Structure: %s | Momentum: %s",
@@ -2499,6 +2744,12 @@ int OnInit()
                InpUseMultiTF ? "ON" : "OFF",
                InpUseStructure ? "ON" : "OFF",
                InpUseMomentum ? "ON" : "OFF");
+   PrintFormat("[INIT] RSI_Div: %s | ConsecCandles: %s | GridTrend: %s | GridDynStep: %s | GridDD: %.0f",
+               InpUseRSIDivergence ? "ON" : "OFF",
+               InpUseConsecCandles ? "ON" : "OFF",
+               InpGridTrendAware ? "ON" : "OFF",
+               InpGridDynamicStep ? "ON" : "OFF",
+               InpGridDDLimit);
 
    return INIT_SUCCEEDED;
   }
@@ -2520,7 +2771,7 @@ void OnDeinit(const int reason)
    if(g_hHTF_RSI != INVALID_HANDLE) IndicatorRelease(g_hHTF_RSI);
    if(g_hHTF_ATR != INVALID_HANDLE) IndicatorRelease(g_hHTF_ATR);
 
-   Print("[DEINIT] ScalpGrid CEZ Pro v3.0 stopped. Reason: ", reason);
+   Print("[DEINIT] ScalpGrid CEZ Pro v4.0 stopped. Reason: ", reason);
   }
 
 //+------------------------------------------------------------------+
@@ -2559,17 +2810,19 @@ void OnTick()
 
    symInfo.RefreshRates();
 
-   // Warm-up period: let indicators stabilize
+   // Warm-up period: let indicators stabilize proportionally
    if(!g_initialized)
      {
       g_warmupCount++;
       // Run CE calculation multiple times to establish state
       CalcChandelierExit();
 
-      if(g_warmupCount >= 3)
+      // Proportional warmup: use the larger of CE period or ZLSMA period
+      int requiredWarmup = MathMax(5, MathMax(InpCEPeriod, InpZLSMAPeriod) / 4);
+      if(g_warmupCount >= requiredWarmup)
         {
          g_initialized = true;
-         Print("[INIT] Warmup complete after ", g_warmupCount, " bars");
+         Print("[INIT] Warmup complete after ", g_warmupCount, " bars (required: ", requiredWarmup, ")");
         }
       return;
      }
