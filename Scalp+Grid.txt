@@ -3,12 +3,12 @@
 //|          Advanced Scalping + Grid EA - Complete Market Analysis  |
 //|          Rebuilt with proper CE, ZLSMA, multi-factor confluence  |
 //+------------------------------------------------------------------+
-#property copyright "ScalpGrid Pro v3.0 - Production Grade"
+#property copyright "ScalpGrid Pro v4.0 - Production Grade"
 #property link      "https://github.com/geraked/metatrader5"
-#property version   "3.00"
+#property version   "4.00"
 #property description "Advanced Scalping + Grid EA using Chandelier Exit, ZLSMA,"
-#property description "RSI, Bollinger Bands, ADX, Volume Profile on Heikin Ashi"
-#property description "with intelligent grid recovery and confluence scoring"
+#property description "RSI Divergence, BB, ADX, Volume, Momentum on Heikin Ashi"
+#property description "with trend-aware intelligent grid recovery and confluence scoring"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -93,6 +93,10 @@ input bool        InpUseMomentum       = true;       // Use Momentum Confirmatio
 input int         InpMomentumPeriod    = 10;         // Momentum Period
 input bool        InpUseStructure      = true;       // Use Market Structure (HH/HL/LH/LL)
 input int         InpStructureLookback = 50;         // Structure Lookback Bars
+input bool        InpUseRSIDivergence  = true;       // Use RSI Divergence Detection
+input int         InpRSIDivLookback    = 20;         // RSI Divergence Lookback Bars
+input bool        InpUseConsecCandles  = true;       // Use Consecutive HA Candle Confirmation
+input int         InpConsecCandleMin   = 2;          // Minimum Consecutive Candles (2-5)
 
 input group "═══════════ SCALPING SETTINGS ═══════════"
 input double      InpTPCoefficient     = 1.5;
@@ -114,6 +118,13 @@ input double      InpGridTPPoints      = 0;
 input bool        InpGridBasketClose   = true;
 input double      InpGridBasketTP      = 0;
 input bool        InpGridSmartEntry    = true;       // Only add grid on pullback to value
+input bool        InpGridTrendAware    = true;       // Stop adding grid against strong trend
+input double      InpGridDDLimit       = 0;          // Grid Max DD $ per basket (0=off)
+input int         InpGridCooldownBars  = 3;          // Min bars between grid additions
+input bool        InpGridDynamicStep   = true;       // Widen grid step at deeper levels
+input double      InpGridStepScale     = 0.15;       // Step scale per grid level (0.1-0.3)
+input bool        InpGridPartialClose  = false;      // Close profitable grid positions early
+input double      InpGridPartialTP     = 0;          // Grid Partial TP points (0=ATR*0.5)
 
 input group "═══════════ RISK MANAGEMENT ═══════════"
 input ENUM_RISK_MODE InpRiskMode       = RISK_PERCENT_BALANCE;
@@ -225,6 +236,18 @@ int            g_warmupCount;
 double         g_swingHighs[];
 double         g_swingLows[];
 int            g_structureDir;  // 1=bullish structure, -1=bearish, 0=neutral
+
+// Grid tracking
+datetime       g_gridLastBuyTime;
+datetime       g_gridLastSellTime;
+double         g_gridPeakEquity;
+
+// RSI divergence
+int            g_rsiDivSignal;   // 1=bullish div, -1=bearish div, 0=none
+
+// Consecutive candles
+int            g_consecBullCount;
+int            g_consecBearCount;
 
 //+------------------------------------------------------------------+
 //| SAFE COPY BUFFER                                                  |
@@ -608,7 +631,7 @@ ENUM_TREND_STATE DetectTrendState()
 double GetVolumeRatio()
   {
    if(!InpUseVolumeConfirm)
-      return 1.5;  // Always pass if disabled
+      return 1.0;  // Neutral value if disabled (won't trigger bonus or penalty)
 
    MqlRates rates[];
    int need = InpVolumeLookback + 5;
@@ -656,6 +679,148 @@ double GetMomentum()
    g_momentumValue = ((rates[1].close - rates[1 + InpMomentumPeriod].close) /
                        rates[1 + InpMomentumPeriod].close) * 100.0;
    return g_momentumValue;
+  }
+
+//+------------------------------------------------------------------+
+//| DETECT RSI DIVERGENCE                                             |
+//| Bullish: price makes lower low but RSI makes higher low           |
+//| Bearish: price makes higher high but RSI makes lower high         |
+//+------------------------------------------------------------------+
+int DetectRSIDivergence()
+  {
+   if(!InpUseRSIDivergence)
+      return 0;
+
+   double rsi[];
+   if(!SafeCopyBuffer(g_hRSI, 0, 1, InpRSIDivLookback + 2, rsi))
+      return 0;
+
+   int rsiSize = ArraySize(rsi);
+   if(rsiSize < InpRSIDivLookback)
+      return 0;
+
+   MqlRates rates[];
+   if(!SafeCopyRates(rates, 0, InpRSIDivLookback + 5))
+      return 0;
+
+   int rSize = ArraySize(rates);
+   if(rSize < InpRSIDivLookback)
+      return 0;
+
+   // Find two most recent swing lows/highs in price and compare RSI
+   int lookLeft  = 2;
+   int lookRight = 2;
+
+   int swLowIdx[];
+   int swHighIdx[];
+   int swLowCount  = 0;
+   int swHighCount = 0;
+   ArrayResize(swLowIdx, 0);
+   ArrayResize(swHighIdx, 0);
+
+   int limit = MathMin(rSize - lookLeft - 1, InpRSIDivLookback);
+   for(int i = lookRight + 1; i < limit; i++)
+     {
+      bool isLow  = true;
+      bool isHigh = true;
+
+      for(int j = 1; j <= lookLeft; j++)
+        {
+         if(i + j >= rSize) { isLow = false; isHigh = false; break; }
+         if(rates[i].low >= rates[i + j].low)   isLow = false;
+         if(rates[i].high <= rates[i + j].high) isHigh = false;
+        }
+      for(int j = 1; j <= lookRight; j++)
+        {
+         if(i - j < 0) { isLow = false; isHigh = false; break; }
+         if(rates[i].low >= rates[i - j].low)   isLow = false;
+         if(rates[i].high <= rates[i - j].high) isHigh = false;
+        }
+
+      if(isLow && swLowCount < 3)
+        {
+         swLowCount++;
+         ArrayResize(swLowIdx, swLowCount);
+         swLowIdx[swLowCount - 1] = i;
+        }
+      if(isHigh && swHighCount < 3)
+        {
+         swHighCount++;
+         ArrayResize(swHighIdx, swHighCount);
+         swHighIdx[swHighCount - 1] = i;
+        }
+
+      if(swLowCount >= 2 && swHighCount >= 2)
+         break;
+     }
+
+   // Bullish divergence: price lower low + RSI higher low
+   if(swLowCount >= 2)
+     {
+      int idx0 = swLowIdx[0];  // More recent
+      int idx1 = swLowIdx[1];  // Older
+      if(idx0 < rsiSize && idx1 < rsiSize)
+        {
+         if(rates[idx0].low < rates[idx1].low && rsi[idx0] > rsi[idx1])
+           {
+            g_rsiDivSignal = 1;
+            return 1;
+           }
+        }
+     }
+
+   // Bearish divergence: price higher high + RSI lower high
+   if(swHighCount >= 2)
+     {
+      int idx0 = swHighIdx[0]; // More recent
+      int idx1 = swHighIdx[1]; // Older
+      if(idx0 < rsiSize && idx1 < rsiSize)
+        {
+         if(rates[idx0].high > rates[idx1].high && rsi[idx0] < rsi[idx1])
+           {
+            g_rsiDivSignal = -1;
+            return -1;
+           }
+        }
+     }
+
+   g_rsiDivSignal = 0;
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| COUNT CONSECUTIVE HA CANDLES                                       |
+//| Count how many recent HA bars are in the same direction            |
+//+------------------------------------------------------------------+
+void CountConsecutiveCandles()
+  {
+   g_consecBullCount = 0;
+   g_consecBearCount = 0;
+
+   if(!InpUseConsecCandles)
+      return;
+
+   int haSize = ArraySize(g_haClose);
+   if(haSize < 8)
+      return;
+
+   // Count consecutive bullish candles from bar[1] backward
+   for(int i = 1; i < haSize && i < 10; i++)
+     {
+      if(g_haClose[i] > g_haOpen[i])
+         g_consecBullCount++;
+      else
+         break;
+     }
+
+   // Count consecutive bearish candles from bar[1] backward
+   for(int i = 1; i < haSize && i < 10; i++)
+     {
+      if(g_haClose[i] < g_haOpen[i])
+         g_consecBearCount++;
+      else
+         break;
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -729,6 +894,27 @@ int DetectMarketStructure()
    bool lowerHighs  = (swHighs[0] < swHighs[1]);
    bool lowerLows   = (swLows[0] < swLows[1]);
 
+   // Enhanced: if 3 swing points available, require 2 consecutive confirmations
+   if(swHighCount >= 3 && swLowCount >= 3)
+     {
+      bool hh2 = (swHighs[1] > swHighs[2]);  // Previous pair also HH
+      bool hl2 = (swLows[1] > swLows[2]);     // Previous pair also HL
+      bool lh2 = (swHighs[1] < swHighs[2]);
+      bool ll2 = (swLows[1] < swLows[2]);
+
+      // Strong structure: 2 consecutive HH/HL or LH/LL
+      if(higherHighs && higherLows && hh2 && hl2)
+        {
+         g_structureDir = 1;
+         return 2;  // Strong bullish structure (return 2 for extra weight)
+        }
+      if(lowerHighs && lowerLows && lh2 && ll2)
+        {
+         g_structureDir = -1;
+         return -2; // Strong bearish structure
+        }
+     }
+
    if(higherHighs && higherLows)
      {
       g_structureDir = 1;   // Bullish structure
@@ -759,10 +945,36 @@ int GetHTFTrend()
    if(ArraySize(htfRSI) < 2)
       return 0;
 
-   // Simple HTF trend: RSI above 50 = bullish bias, below 50 = bearish bias
+   int rsiVote = 0;
    if(htfRSI[0] > 55)
+      rsiVote = 1;
+   else if(htfRSI[0] < 45)
+      rsiVote = -1;
+
+   // Also check HTF RSI momentum (is RSI increasing or decreasing?)
+   int rsiMomVote = 0;
+   if(htfRSI[0] > htfRSI[1])
+      rsiMomVote = 1;
+   else if(htfRSI[0] < htfRSI[1])
+      rsiMomVote = -1;
+
+   // HTF ATR direction: check if HTF volatility is expanding (trending)
+   double htfATR[];
+   if(SafeCopyBuffer(g_hHTF_ATR, 0, 1, 3, htfATR) && ArraySize(htfATR) >= 2)
+     {
+      // If HTF ATR is expanding, the trend signal is more reliable
+      if(htfATR[0] > htfATR[1] && rsiVote != 0)
+         return rsiVote;  // Expanding ATR confirms trend direction
+     }
+
+   // If RSI level and RSI momentum agree, that's a strong signal
+   if(rsiVote != 0 && rsiMomVote == rsiVote)
+      return rsiVote;
+
+   // RSI level alone (weaker)
+   if(htfRSI[0] > 58)
       return 1;
-   if(htfRSI[0] < 45)
+   if(htfRSI[0] < 42)
       return -1;
 
    return 0;
@@ -836,6 +1048,13 @@ int GetSignal()
 
    //--- HTF trend
    int htfTrend = GetHTFTrend();
+
+   //--- RSI Divergence
+   int rsiDivergence = DetectRSIDivergence();
+
+   //--- Consecutive candles (uses HA cache if available)
+   if(InpUseHeikinAshi)
+      CountConsecutiveCandles();
 
    //--- Price data
    double close1 = 0, close2 = 0, close3 = 0;
@@ -920,7 +1139,7 @@ int GetSignal()
         }
      }
 
-   //--- Factor 3: Candle Pattern (weight: 1)
+   //--- Factor 3: Candle Pattern (weight: 0-1)
    bool bullCandle = (close1 > open1);
    bool bearCandle = (close1 < open1);
 
@@ -935,21 +1154,14 @@ int GetSignal()
       buyScore += 1;
       g_signalDetails += "CANDLE+ ";
      }
-   else if(bullCandle)
-     {
-      // Weak candle - still count but less
-      buyScore += 1;
-     }
+   // Weak candle: no score added (direction noted but not reliable enough)
 
    if(strongBearCandle)
      {
       sellScore += 1;
       g_signalDetails += "CANDLE- ";
      }
-   else if(bearCandle)
-     {
-      sellScore += 1;
-     }
+   // Weak candle: no score added
 
    //--- Factor 4: RSI (weight: 1)
    if(InpUseRSIFilter)
@@ -1068,30 +1280,62 @@ int GetSignal()
         }
      }
 
-   //--- Factor 8: Momentum (weight: 1)
+   //--- Factor 8: Momentum (weight: 1) - Adaptive thresholds
    if(InpUseMomentum)
      {
-      if(momentum > 0.1)
+      // Scale momentum threshold with volatility
+      double momThreshold = 0.1;
+      if(g_volRegime == VOL_HIGH)
+         momThreshold = 0.15;
+      else if(g_volRegime == VOL_EXTREME)
+         momThreshold = 0.25;
+      else if(g_volRegime == VOL_LOW)
+         momThreshold = 0.05;
+
+      if(momentum > momThreshold)
         {
          buyScore += 1;
          g_signalDetails += "MOM+ ";
         }
-      if(momentum < -0.1)
+      if(momentum < -momThreshold)
         {
          sellScore += 1;
          g_signalDetails += "MOM- ";
         }
+
+      // PENALTY: Momentum fading (was strong, now weakening)
+      if(momentum > 0 && momentum < momThreshold * 0.5 && g_trendState == TREND_WEAK_UP)
+        {
+         buyScore -= 1;
+         g_signalDetails += "MOMFADE! ";
+        }
+      if(momentum < 0 && momentum > -momThreshold * 0.5 && g_trendState == TREND_WEAK_DOWN)
+        {
+         sellScore -= 1;
+         g_signalDetails += "MOMFADE! ";
+        }
      }
 
-   //--- Factor 9: Market Structure (weight: 1)
+   //--- Factor 9: Market Structure (weight: 1-2, enhanced with 3-swing)
    if(InpUseStructure)
      {
-      if(structure == 1)
+      // structure returns 2/-2 for strong (3-swing confirmed), 1/-1 for normal
+      if(structure >= 2)
+        {
+         buyScore += 2;
+         g_signalDetails += "STRUCT++ ";
+        }
+      else if(structure == 1)
         {
          buyScore += 1;
          g_signalDetails += "STRUCT+ ";
         }
-      if(structure == -1)
+      if(structure <= -2)
+        {
+         sellScore += 2;
+         g_signalDetails += "STRUCT-- ";
+        }
+      else if(structure == -1)
         {
          sellScore += 1;
          g_signalDetails += "STRUCT- ";
@@ -1114,6 +1358,71 @@ int GetSignal()
          g_signalDetails += "HTF- ";
         }
      }
+
+   //--- Factor 11: RSI Divergence (weight: 1-2)
+   if(InpUseRSIDivergence)
+     {
+      if(rsiDivergence == 1)
+        {
+         buyScore += 2;
+         g_signalDetails += "RSI_DIV+ ";
+         // Divergence against strong sell pressure is very valuable
+         if(sellScore > buyScore)
+            buyScore += 1;
+        }
+      if(rsiDivergence == -1)
+        {
+         sellScore += 2;
+         g_signalDetails += "RSI_DIV- ";
+         if(buyScore > sellScore)
+            sellScore += 1;
+        }
+     }
+
+   //--- Factor 12: Consecutive HA Candles (weight: 1)
+   if(InpUseConsecCandles && InpUseHeikinAshi)
+     {
+      if(g_consecBullCount >= InpConsecCandleMin)
+        {
+         buyScore += 1;
+         g_signalDetails += StringFormat("HA%d+ ", g_consecBullCount);
+        }
+      if(g_consecBearCount >= InpConsecCandleMin)
+        {
+         sellScore += 1;
+         g_signalDetails += StringFormat("HA%d- ", g_consecBearCount);
+        }
+
+      // PENALTY: Exhaustion after too many consecutive candles (>= 6)
+      if(g_consecBullCount >= 6)
+        {
+         buyScore -= 1;
+         g_signalDetails += "HA_EXHAUST! ";
+        }
+      if(g_consecBearCount >= 6)
+        {
+         sellScore -= 1;
+         g_signalDetails += "HA_EXHAUST! ";
+        }
+     }
+
+   //--- Factor 13: ZLSMA Crossover (weight: 1)
+   // Price crossing ZLSMA is a momentum shift signal
+   {
+      bool zlsmaCrossUp   = (close2 < g_zlsma2 && close1 > g_zlsma1);
+      bool zlsmaCrossDown = (close2 > g_zlsma2 && close1 < g_zlsma1);
+
+      if(zlsmaCrossUp)
+        {
+         buyScore += 1;
+         g_signalDetails += "ZLx+ ";
+        }
+      if(zlsmaCrossDown)
+        {
+         sellScore += 1;
+         g_signalDetails += "ZLx- ";
+        }
+   }
 
    //--- Volatility regime adjustments
    if(g_volRegime == VOL_EXTREME)
